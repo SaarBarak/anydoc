@@ -1,0 +1,130 @@
+# Cross-builds Python wheels for every in-house tag and attaches them to that
+# tag's GitHub release.
+#
+# This is ours, not upstream's. `release.yml` cannot be reused: it gates on all
+# five version locations matching the tag, which a `-inhouse.N` tag never will,
+# it runs on `blacksmith-*` runners this fork has no access to, and it publishes
+# to PyPI and npm — which must never fire from a fork.
+#
+# The tag filter is deliberately narrow. Merges from upstream bring their
+# release tags along, and those must not trigger a fork build.
+name: In-house wheels
+
+on:
+  push:
+    tags: ['v*-inhouse.*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing in-house tag to (re)build wheels for
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  gate:
+    name: Patch is wired
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      # Guards the one failure that is otherwise silent: an upstream merge drops
+      # the [patch.crates-io] block, the build succeeds, and the wheels ship
+      # with stock pdf-inspector and no RTL fix.
+      - run: python3 scripts/verify_inhouse.py
+
+  build:
+    name: ${{ matrix.target }}
+    needs: gate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # manylinux2014 == glibc 2.17, matching upstream's floor. aarch64
+          # builds natively on arm runners, so no QEMU is involved.
+          - target: x86_64-unknown-linux-gnu
+            host: ubuntu-latest
+            manylinux: '2014'
+          - target: aarch64-unknown-linux-gnu
+            host: ubuntu-24.04-arm
+            manylinux: '2014'
+          - target: x86_64-unknown-linux-musl
+            host: ubuntu-latest
+            manylinux: musllinux_1_2
+            musl: true
+          - target: aarch64-unknown-linux-musl
+            host: ubuntu-24.04-arm
+            manylinux: musllinux_1_2
+            musl: true
+          - target: x86_64-apple-darwin
+            host: macos-13
+          - target: aarch64-apple-darwin
+            host: macos-14
+          - target: x86_64-pc-windows-msvc
+            host: windows-latest
+    runs-on: ${{ matrix.host }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: actions/setup-python@v6
+        if: runner.os != 'Linux'
+        with:
+          python-version: '3.13'
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux || '' }}
+          args: --release --locked --manifest-path python/Cargo.toml --out dist
+          sccache: 'true'
+
+      # abi3-py310 means one wheel serves 3.10 through 3.14, so a single
+      # interpreter is enough to prove the artifact imports and converts.
+      - name: Smoke test (native)
+        if: ${{ !matrix.musl }}
+        shell: bash
+        run: |
+          python -m pip install --no-index --find-links dist firecrawl-anydoc
+          python -m unittest discover -s python/tests
+
+      # musl wheels cannot run on the glibc host, so they are exercised in an
+      # Alpine container of the same architecture.
+      - name: Smoke test (musl, in Alpine)
+        if: ${{ matrix.musl }}
+        run: |
+          docker run --rm -v "$PWD:/io" -w /io python:3.13-alpine sh -c "
+            python -m pip install --no-index --find-links dist firecrawl-anydoc &&
+            python -m unittest discover -s python/tests"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wheels-${{ matrix.target }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  publish:
+    name: Attach wheels to the release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist
+      - run: ls -la dist
+      # The release usually already exists — the tag is cut by hand and the
+      # notes are written there. Create it only if it does not.
+      - name: Upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release view "$TAG" >/dev/null 2>&1 ||
+            gh release create "$TAG" --title "$TAG" --generate-notes
+          gh release upload "$TAG" dist/*.whl --clobber

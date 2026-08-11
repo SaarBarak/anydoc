@@ -88,14 +88,16 @@ def check_pdf(path: str) -> bool:
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) < 2:
-        print(__doc__)
-        return 2
     print("== Cargo.lock ==")
     ok = check_lockfile()
-    print("== conversion ==")
-    for pdf in argv[1:]:
-        ok &= check_pdf(pdf)
+    # With no PDFs given, run as a lockfile-only gate. CI uses this: it does
+    # not ship a Hebrew corpus, but it still must fail if the patch is gone.
+    if len(argv) > 1:
+        print("== conversion ==")
+        for pdf in argv[1:]:
+            ok &= check_pdf(pdf)
+    else:
+        print("(no PDFs given — skipping the conversion check)")
     print("OK" if ok else "FAILED")
     return 0 if ok else 1
 
