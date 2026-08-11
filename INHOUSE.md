@@ -68,24 +68,44 @@ lives in the git tag and nowhere else.
 
 ## Installing
 
+### From a release wheel — no Rust needed
+
+Each in-house tag has a GitHub release carrying a prebuilt wheel. Installs in
+about a second:
+
+```bash
+pip install https://github.com/SaarBarak/anydoc/releases/download/v0.1.8-inhouse.1/firecrawl_anydoc-0.1.8-cp310-abi3-manylinux_2_35_x86_64.whl
+```
+
+```toml
+[tool.uv.sources]
+firecrawl-anydoc = { url = "https://github.com/SaarBarak/anydoc/releases/download/v0.1.8-inhouse.1/firecrawl_anydoc-0.1.8-cp310-abi3-manylinux_2_35_x86_64.whl" }
+```
+
+The wheel is `abi3-py310`, so one file covers CPython 3.10 through 3.14. It is
+**Linux x86_64, glibc ≥ 2.35** (Ubuntu 22.04+). We build it by hand — the
+upstream release workflow is disabled on this fork, and would fail its version
+gate on an `-inhouse` tag anyway. Rebuild with:
+
+```bash
+cd python && maturin build --release --out dist
+gh release upload v0.1.8-inhouse.<n> dist/*.whl
+```
+
+### From source — any platform
+
 ```bash
 pip install "firecrawl-anydoc @ git+https://github.com/SaarBarak/anydoc.git@inhouse/main#subdirectory=python"
 ```
 
-With uv, in the consuming project's `pyproject.toml`:
-
 ```toml
-[project]
-dependencies = ["firecrawl-anydoc"]
-
 [tool.uv.sources]
 firecrawl-anydoc = { git = "https://github.com/SaarBarak/anydoc.git", branch = "inhouse/main", subdirectory = "python" }
 ```
 
-Requires a Rust toolchain (≥1.88) on the installing machine — maturin compiles
-anydoc and pdf-inspector from source. There are no prebuilt wheels.
-
-To pin a build exactly, use the tag instead of the branch: `@v0.1.8-inhouse.1`.
+Needs a Rust toolchain (≥1.88); maturin compiles anydoc and pdf-inspector from
+source, about a minute cold. Swap `@inhouse/main` for `@v0.1.8-inhouse.1` to
+pin a build exactly.
 
 ## Verifying
 
