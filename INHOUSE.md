@@ -82,15 +82,45 @@ pip install https://github.com/SaarBarak/anydoc/releases/download/v0.1.8-inhouse
 firecrawl-anydoc = { url = "https://github.com/SaarBarak/anydoc/releases/download/v0.1.8-inhouse.1/firecrawl_anydoc-0.1.8-cp310-abi3-manylinux_2_35_x86_64.whl" }
 ```
 
-The wheel is `abi3-py310`, so one file covers CPython 3.10 through 3.14. It is
-**Linux x86_64, glibc ≥ 2.35** (Ubuntu 22.04+). We build it by hand — the
-upstream release workflow is disabled on this fork, and would fail its version
-gate on an `-inhouse` tag anyway. Rebuild with:
+Wheels are `abi3-py310`, so one file per platform covers CPython 3.10 through
+3.14.
+
+`v0.1.8-inhouse.1` carries a single hand-built wheel (Linux x86_64,
+glibc ≥ 2.35). From `v0.1.8-inhouse.2` on,
+[`.github/workflows/inhouse-wheels.yml`](.github/workflows/inhouse-wheels.yml)
+builds all seven targets on tag push and attaches them automatically:
+
+| platform | targets |
+| --- | --- |
+| Linux glibc (manylinux2014, glibc ≥ 2.17) | x86_64, aarch64 |
+| Linux musl (musllinux_1_2) | x86_64, aarch64 |
+| macOS | x86_64, arm64 |
+| Windows | x86_64 |
+
+### Enabling the workflow (one time)
+
+GitHub keeps Actions dormant on forks until a human opts in, and there is no
+API for it. Once, in this repo's **Actions** tab, click *"I understand my
+workflows, go ahead and enable them"*.
+
+Then disable the inherited upstream workflows — they target `blacksmith-*`
+runners this fork cannot schedule, so their jobs would queue forever:
 
 ```bash
-cd python && maturin build --release --out dist
-gh release upload v0.1.8-inhouse.<n> dist/*.whl
+gh workflow disable Release --repo SaarBarak/anydoc
+gh workflow disable CI      --repo SaarBarak/anydoc
+gh workflow disable pages   --repo SaarBarak/anydoc
 ```
+
+Upstream's `release.yml` also triggers on `v*`, which matches our tags. It
+cannot actually publish — its version gate rejects an `-inhouse` tag, and the
+fork holds no PyPI or npm credentials — but disabling it keeps the tab clean.
+
+`workflow_dispatch` (rebuilding wheels for an existing tag) additionally needs
+this workflow present on the repo's **default branch**; GitHub only registers
+dispatchable workflows from there. Either point the default branch at
+`inhouse/main`, or just cut a new tag — the `push` trigger works from any
+branch, as long as the tagged commit contains the workflow file.
 
 ### From source — any platform
 
