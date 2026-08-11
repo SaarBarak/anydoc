@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Verify the in-house build: the patch is wired, and the RTL fix is live.
+"""Verify the RTL-fix build: the patch is wired, and the RTL fix is live.
 
-    python scripts/verify_inhouse.py path/to/hebrew.pdf [more.pdf ...]
+    python scripts/verify_rtl_fix.py path/to/hebrew.pdf [more.pdf ...]
 
 Two independent checks, because they fail in different ways:
 

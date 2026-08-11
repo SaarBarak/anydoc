@@ -36,17 +36,17 @@ zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 lto = "thin"
 strip = "symbols"
 
-# --- in-house overrides -----------------------------------------------------
+# --- RTL-fix overrides -----------------------------------------------------
 # Redirects the crates.io `pdf-inspector` dependency above to our fork, which
 # carries the RTL logical-order fix. Line 31 stays untouched so merges from
 # upstream never conflict here; only this block is ours.
 #
 # The pin is a tag, not a branch, so builds are reproducible: `v<upstream
-# version>-inhouse.<n>`. Bump the suffix for every in-house change and update
-# the tag here. See INHOUSE.md for the full procedure.
+# version>-rtl-fix.<n>`. Bump the suffix for every RTL-fix change and update
+# the tag here. See RTL-FIX.md for the full procedure.
 #
 # The fork's crate version must stay within ^0.1.8 to satisfy line 31 — cargo
 # rejects the patch outright otherwise ("candidate versions found which didn't
-# match"). Track the in-house revision with the tag, never the crate version.
+# match"). Track the RTL-fix revision with the tag, never the crate version.
 [patch.crates-io]
-pdf-inspector = { git = "https://github.com/SaarBarak/pdf-inspector.git", tag = "v0.1.8-inhouse.1" }
+pdf-inspector = { git = "https://github.com/SaarBarak/pdf-inspector.git", tag = "v0.1.8-rtl-fix.1" }

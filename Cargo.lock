@@ -1072,7 +1072,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 [[package]]
 name = "pdf-inspector"
 version = "0.1.8"
-source = "git+https://github.com/SaarBarak/pdf-inspector.git?tag=v0.1.8-inhouse.1#bbda40feaa766868967a7df27605064abb266ac2"
+source = "git+https://github.com/SaarBarak/pdf-inspector.git?tag=v0.1.8-rtl-fix.1#bbda40feaa766868967a7df27605064abb266ac2"
 dependencies = [
  "env_logger",
  "include_dir",

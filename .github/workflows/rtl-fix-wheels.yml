@@ -1,22 +1,22 @@
-# Cross-builds Python wheels for every in-house tag and attaches them to that
+# Cross-builds Python wheels for every RTL-fix tag and attaches them to that
 # tag's GitHub release.
 #
 # This is ours, not upstream's. `release.yml` cannot be reused: it gates on all
-# five version locations matching the tag, which a `-inhouse.N` tag never will,
+# five version locations matching the tag, which a `-rtl-fix.N` tag never will,
 # it runs on `blacksmith-*` runners this fork has no access to, and it publishes
 # to PyPI and npm — which must never fire from a fork.
 #
 # The tag filter is deliberately narrow. Merges from upstream bring their
 # release tags along, and those must not trigger a fork build.
-name: In-house wheels
+name: RTL-fix wheels
 
 on:
   push:
-    tags: ['v*-inhouse.*']
+    tags: ['v*-rtl-fix.*']
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing in-house tag to (re)build wheels for
+        description: Existing RTL-fix tag to (re)build wheels for
         required: true
 
 permissions:
@@ -36,7 +36,7 @@ jobs:
       # Guards the one failure that is otherwise silent: an upstream merge drops
       # the [patch.crates-io] block, the build succeeds, and the wheels ship
       # with stock pdf-inspector and no RTL fix.
-      - run: python3 scripts/verify_inhouse.py
+      - run: python3 scripts/verify_rtl_fix.py
 
   build:
     name: ${{ matrix.target }}
