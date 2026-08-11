@@ -15,12 +15,16 @@ exactly one call site, [`src/formats/pdf.rs`](src/formats/pdf.rs). So a
 actually runs is compiled into `anydoc._anydoc`. The only way to get our RTL fix
 into anydoc is to rebuild anydoc from source with a Cargo-level override.
 
-The dependency chain:
+What we maintain:
 
 ```
-firecrawl/firecrawl  ──uses──>  anydoc  ──uses──>  pdf-inspector
-   (apps/api/native)             (this repo)      (our fork: RTL fix)
+anydoc  ──links──>  pdf-inspector
+(this repo)         (our fork: RTL fix)
 ```
+
+Upstream's `firecrawl/firecrawl` links anydoc the same way, from
+`apps/api/native`. We do not fork it — that is recorded only so the shape of
+the problem is obvious if we ever need the fix to reach that layer too.
 
 ## Version scheme
 
