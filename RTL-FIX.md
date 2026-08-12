@@ -83,17 +83,16 @@ lives in the git tag and nowhere else.
 ### From a release wheel — no Rust needed
 
 Each RTL-fix tag has a GitHub release carrying prebuilt wheels. Installs in
-about a second. Asset names embed the platform tag, so copy the URL for your
-platform from the
+about a second — Linux x86_64 shown here; the other five asset names are on the
 [release page](https://github.com/SaarBarak/anydoc/releases/tag/v0.1.8-rtl-fix.2):
 
 ```bash
-pip install https://github.com/SaarBarak/anydoc/releases/download/v0.1.8-rtl-fix.2/<asset>.whl
+pip install https://github.com/SaarBarak/anydoc/releases/download/v0.1.8-rtl-fix.2/firecrawl_anydoc-0.1.8-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
 ```
 
 ```toml
 [tool.uv.sources]
-firecrawl-anydoc = { url = "https://github.com/SaarBarak/anydoc/releases/download/v0.1.8-rtl-fix.2/<asset>.whl" }
+firecrawl-anydoc = { url = "https://github.com/SaarBarak/anydoc/releases/download/v0.1.8-rtl-fix.2/firecrawl_anydoc-0.1.8-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl" }
 ```
 
 Wheels are `abi3-py310`, so one file per platform covers CPython 3.10 through
