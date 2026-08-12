@@ -61,8 +61,11 @@ jobs:
             host: ubuntu-24.04-arm
             manylinux: musllinux_1_2
             musl: true
-          - target: x86_64-apple-darwin
-            host: macos-13
+          # No x86_64-apple-darwin: GitHub retired the `macos-13` Intel runners,
+          # and on v0.1.8-rtl-fix.1 that job sat unscheduled for the full 24h
+          # limit, was cancelled, and took the whole `publish` job down with it —
+          # so a release that built 7 of 8 targets shipped zero wheels. Restore
+          # the target with whatever Intel label is available if one is needed.
           - target: aarch64-apple-darwin
             host: macos-14
           - target: x86_64-pc-windows-msvc
@@ -110,6 +113,10 @@ jobs:
   publish:
     name: Attach wheels to the release
     needs: build
+    # Attach whatever built. A single unavailable runner class must not be able
+    # to withhold every other platform's wheel, which is what a plain `needs`
+    # does: one cancelled matrix job skips this whole job silently.
+    if: always()
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v8
@@ -117,7 +124,13 @@ jobs:
           pattern: wheels-*
           merge-multiple: true
           path: dist
-      - run: ls -la dist
+      - name: Require at least one wheel
+        run: |
+          ls -la dist
+          if ! compgen -G 'dist/*.whl' >/dev/null; then
+            echo "::error::no wheels were produced by any target"
+            exit 1
+          fi
       # The release usually already exists — the tag is cut by hand and the
       # notes are written there. Create it only if it does not.
       - name: Upload

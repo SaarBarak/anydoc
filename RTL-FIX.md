@@ -48,8 +48,20 @@ Current alignment:
 
 | Repo                     | Upstream base | RTL-fix tag       | Pinned SHA |
 | ------------------------ | ------------- | ------------------ | ---------- |
-| `SaarBarak/pdf-inspector`| 0.1.8         | `v0.1.8-rtl-fix.1` | `bbda40fe` |
-| `SaarBarak/anydoc`       | 0.1.8         | `v0.1.8-rtl-fix.1` | this branch |
+| `SaarBarak/pdf-inspector`| 0.1.8         | `v0.1.8-rtl-fix.2` | `8f4df7df` |
+| `SaarBarak/anydoc`       | 0.1.8         | `v0.1.8-rtl-fix.2` | this branch |
+
+### What each revision carries
+
+| Tag                | Change |
+| ------------------ | ------ |
+| `v0.1.8-rtl-fix.1` | RTL logical-order extraction, mirrored brackets, tagged-table column order |
+| `v0.1.8-rtl-fix.2` | Recovers CIDs a `/ToUnicode` CMap never names, via the embedded font's cmap |
+
+The `.2` fix is not RTL-specific, but it surfaced through Hebrew: producers that
+omit one glyph from the ToUnicode CMap make that letter disappear from every
+extractor's output. Nun (U+05E0) was the observed casualty — see the
+[pdf-inspector release notes](https://github.com/SaarBarak/pdf-inspector/releases/tag/v0.1.8-rtl-fix.2).
 
 ### Do not put `-rtl-fix` in the crate version
 
@@ -70,16 +82,18 @@ lives in the git tag and nowhere else.
 
 ### From a release wheel — no Rust needed
 
-Each RTL-fix tag has a GitHub release carrying a prebuilt wheel. Installs in
-about a second:
+Each RTL-fix tag has a GitHub release carrying prebuilt wheels. Installs in
+about a second. Asset names embed the platform tag, so copy the URL for your
+platform from the
+[release page](https://github.com/SaarBarak/anydoc/releases/tag/v0.1.8-rtl-fix.2):
 
 ```bash
-pip install https://github.com/SaarBarak/anydoc/releases/download/v0.1.8-rtl-fix.1/firecrawl_anydoc-0.1.8-cp310-abi3-manylinux_2_35_x86_64.whl
+pip install https://github.com/SaarBarak/anydoc/releases/download/v0.1.8-rtl-fix.2/<asset>.whl
 ```
 
 ```toml
 [tool.uv.sources]
-firecrawl-anydoc = { url = "https://github.com/SaarBarak/anydoc/releases/download/v0.1.8-rtl-fix.1/firecrawl_anydoc-0.1.8-cp310-abi3-manylinux_2_35_x86_64.whl" }
+firecrawl-anydoc = { url = "https://github.com/SaarBarak/anydoc/releases/download/v0.1.8-rtl-fix.2/<asset>.whl" }
 ```
 
 Wheels are `abi3-py310`, so one file per platform covers CPython 3.10 through
@@ -88,14 +102,20 @@ Wheels are `abi3-py310`, so one file per platform covers CPython 3.10 through
 `v0.1.8-rtl-fix.1` carries a single hand-built wheel (Linux x86_64,
 glibc ≥ 2.35). From `v0.1.8-rtl-fix.2` on,
 [`.github/workflows/rtl-fix-wheels.yml`](.github/workflows/rtl-fix-wheels.yml)
-builds all seven targets on tag push and attaches them automatically:
+builds these six targets on tag push and attaches them automatically:
 
 | platform | targets |
 | --- | --- |
 | Linux glibc (manylinux2014, glibc ≥ 2.17) | x86_64, aarch64 |
 | Linux musl (musllinux_1_2) | x86_64, aarch64 |
-| macOS | x86_64, arm64 |
+| macOS | arm64 |
 | Windows | x86_64 |
+
+Intel macOS is absent on purpose. GitHub retired the `macos-13` runners, and on
+`v0.1.8-rtl-fix.1` that job waited the full 24-hour limit, was cancelled, and
+skipped the `publish` job with it — so a run that built 7 of 8 targets attached
+nothing. `publish` now runs even when a target drops out, and uploads whatever
+did build. Add the target back with a current Intel label if you need it.
 
 ### Enabling the workflow (one time)
 
@@ -134,7 +154,7 @@ firecrawl-anydoc = { git = "https://github.com/SaarBarak/anydoc.git", branch = "
 ```
 
 Needs a Rust toolchain (≥1.88); maturin compiles anydoc and pdf-inspector from
-source, about a minute cold. Swap `@rtl-fix` for `@v0.1.8-rtl-fix.1` to
+source, about a minute cold. Swap `@rtl-fix` for `@v0.1.8-rtl-fix.2` to
 pin a build exactly.
 
 ## Verifying
