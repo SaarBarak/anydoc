@@ -5,9 +5,9 @@ exclude = ["fuzz"]
 
 [package]
 name = "anydoc"
-version = "0.1.8"
+version = "0.2.4"
 edition = "2024"
-# Edition 2024 needs 1.85; zip and calamine both raise it to 1.88.
+# Edition 2024 needs 1.85; zip raises it to 1.88.
 rust-version = "1.88"
 description = "Convert documents (doc, docx, odt, rtf, epub, pdf, presentations, spreadsheets, csv) to GitHub-Flavored Markdown"
 license = "MIT"
@@ -22,13 +22,12 @@ insta = "1"
 sha2 = "0.11"
 
 [dependencies]
-calamine = { version = "0.36.1", features = ["dates"] }
 cfb = "0.14.0"
 csv = "1.4.0"
 flate2 = "1"
 encoding_rs = "0.8.35"
 log = "0.4"
-pdf-inspector = "0.1.8"
+pdf-inspector = "1.14.2"
 quick-xml = "0.41.0"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 
@@ -37,16 +36,27 @@ lto = "thin"
 strip = "symbols"
 
 # --- RTL-fix overrides -----------------------------------------------------
-# Redirects the crates.io `pdf-inspector` dependency above to our fork, which
-# carries the RTL logical-order fix. Line 31 stays untouched so merges from
-# upstream never conflict here; only this block is ours.
+# Redirects the crates.io `pdf-inspector` dependency above to our fork. The
+# dependency line stays untouched so merges from upstream never conflict
+# here; only this block is ours.
 #
-# The pin is a tag, not a branch, so builds are reproducible: `v<upstream
-# version>-rtl-fix.<n>`. Bump the suffix for every RTL-fix change and update
-# the tag here. See RTL-FIX.md for the full procedure.
+# Upstream shipped its own RTL visual-order fix in 1.16.0 (firecrawl#440,
+# firecrawl#441) and we now use it as-is. The fork carries only the two
+# patches upstream still lacks:
 #
-# The fork's crate version must stay within ^0.1.8 to satisfy line 31 — cargo
-# rejects the patch outright otherwise ("candidate versions found which didn't
-# match"). Track the RTL-fix revision with the tag, never the crate version.
+#   fix(cid) - a ToUnicode CMap that omits a CID it declares; without it
+#              Hebrew documents lose one letter everywhere it appears.
+#   fix(rtl) - a number separator flanked by digits on one side only is a
+#              neutral (UAX #9 N1/N2), not part of the number; without it
+#              ordered-list markers come out `.1` instead of `1.`.
+#
+# The pin is a tag, not a branch, so builds are reproducible:
+# `v<upstream version>-rtl-fix.<n>`. Bump the suffix for every RTL-fix change
+# and update the tag here. See RTL-FIX.md for the full procedure.
+#
+# The fork's crate version must satisfy the dependency requirement above or
+# cargo rejects the patch outright ("candidate versions found which didn't
+# match"). The fork tracks upstream's version, so keep it >= the requirement
+# and track the RTL-fix revision with the tag, never the crate version.
 [patch.crates-io]
-pdf-inspector = { git = "https://github.com/SaarBarak/pdf-inspector.git", tag = "v0.1.8-rtl-fix.2" }
+pdf-inspector = { git = "https://github.com/SaarBarak/pdf-inspector.git", tag = "v1.17.0-rtl-fix.2" }
