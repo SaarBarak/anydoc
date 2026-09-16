@@ -7,6 +7,7 @@ import urllib.request
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from importlib.metadata import PackageNotFoundError, version
+from io import BytesIO
 from pathlib import Path
 from typing import Literal
 
@@ -186,6 +187,7 @@ def _parse_azure(data: bytes, error: NeedsOcrError) -> str:
             DocumentContentFormat,
         )
         from azure.core.credentials import AzureKeyCredential
+        from pypdf import PdfReader, PdfWriter
         import pdf_inspector
     except ImportError as exc:
         raise AzureError(
@@ -200,11 +202,22 @@ def _parse_azure(data: bytes, error: NeedsOcrError) -> str:
     pages = pdf_inspector.extract_pages_markdown_bytes(data).pages
     merged = [page.markdown for page in pages]
 
+    def _single_page_pdf(page_num: int) -> bytes:
+        # Azure size-limits the whole uploaded payload before `pages=` is
+        # ever applied -- confirmed live: a 5.1MB, 138-page document was
+        # rejected outright asking for one page. Sending only that page's
+        # own bytes keeps every request small regardless of source size.
+        reader = PdfReader(BytesIO(data))
+        writer = PdfWriter()
+        writer.add_page(reader.pages[page_num - 1])
+        out = BytesIO()
+        writer.write(out)
+        return out.getvalue()
+
     def _ocr_page(page_num: int) -> str:
         poller = client.begin_analyze_document(
             "prebuilt-layout",
-            AnalyzeDocumentRequest(bytes_source=data),
-            pages=str(page_num),
+            AnalyzeDocumentRequest(bytes_source=_single_page_pdf(page_num)),
             output_content_format=DocumentContentFormat.MARKDOWN,
         )
         return poller.result().content

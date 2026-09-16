@@ -30,7 +30,7 @@ dynamic = ["version"]
 # fork build pins it themselves (e.g. `[tool.uv.sources]`), same as they
 # already do for this package itself.
 [project.optional-dependencies]
-azure = ["azure-ai-documentintelligence>=1.0.2", "pdf-inspector>=1.17.0"]
+azure = ["azure-ai-documentintelligence>=1.0.2", "pdf-inspector>=1.17.0", "pypdf>=5.0"]
 
 [project.urls]
 Homepage = "https://github.com/firecrawl/anydoc#readme"
