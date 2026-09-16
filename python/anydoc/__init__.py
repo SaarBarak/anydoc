@@ -181,13 +181,15 @@ def _parse_azure(data: bytes, error: NeedsOcrError) -> str:
             f"and {_AZURE_KEY_ENV} set; only one is"
         )
     try:
+        # Re-imported by _single_page_pdf/_analyze_page too (each is
+        # independently self-contained for testing) -- importing everything
+        # here as well means a missing package fails fast, before any real
+        # work, with this one friendly message rather than a wrapped one
+        # from inside a worker thread.
         from azure.ai.documentintelligence import DocumentIntelligenceClient
-        from azure.ai.documentintelligence.models import (
-            AnalyzeDocumentRequest,
-            DocumentContentFormat,
-        )
+        from azure.ai.documentintelligence.models import AnalyzeDocumentRequest, DocumentContentFormat  # noqa: F401
         from azure.core.credentials import AzureKeyCredential
-        from pypdf import PdfReader, PdfWriter
+        from pypdf import PdfReader, PdfWriter  # noqa: F401
         import pdf_inspector
     except ImportError as exc:
         raise AzureError(
@@ -202,29 +204,9 @@ def _parse_azure(data: bytes, error: NeedsOcrError) -> str:
     pages = pdf_inspector.extract_pages_markdown_bytes(data).pages
     merged = [page.markdown for page in pages]
 
-    def _single_page_pdf(page_num: int) -> bytes:
-        # Azure size-limits the whole uploaded payload before `pages=` is
-        # ever applied -- confirmed live: a 5.1MB, 138-page document was
-        # rejected outright asking for one page. Sending only that page's
-        # own bytes keeps every request small regardless of source size.
-        reader = PdfReader(BytesIO(data))
-        writer = PdfWriter()
-        writer.add_page(reader.pages[page_num - 1])
-        out = BytesIO()
-        writer.write(out)
-        return out.getvalue()
-
-    def _ocr_page(page_num: int) -> str:
-        poller = client.begin_analyze_document(
-            "prebuilt-layout",
-            AnalyzeDocumentRequest(bytes_source=_single_page_pdf(page_num)),
-            output_content_format=DocumentContentFormat.MARKDOWN,
-        )
-        return poller.result().content
-
     try:
         with ThreadPoolExecutor(max_workers=_AZURE_MAX_WORKERS) as pool:
-            results = list(pool.map(_ocr_page, error.pages))
+            results = list(pool.map(lambda p: _analyze_page(client, data, p), error.pages))
     except Exception as exc:
         raise AzureError(f"Azure Document Intelligence: {exc}") from exc
 
@@ -233,6 +215,36 @@ def _parse_azure(data: bytes, error: NeedsOcrError) -> str:
 
     joined = "\n\n".join(merged)
     return joined if joined.endswith("\n") else joined + "\n"
+
+
+def _single_page_pdf(data: bytes, page_num: int) -> bytes:
+    """Slices out page_num (1-indexed) as its own single-page PDF. Azure
+    size-limits the whole uploaded payload before `pages=` is ever applied --
+    confirmed live: a 5.1MB, 138-page document was rejected outright asking
+    for one page. Sending only that page's own bytes keeps every request
+    small regardless of source size. Module-level (not nested in
+    `_parse_azure`) so tests can call or patch it directly."""
+    from pypdf import PdfReader, PdfWriter
+
+    reader = PdfReader(BytesIO(data))
+    writer = PdfWriter()
+    writer.add_page(reader.pages[page_num - 1])
+    out = BytesIO()
+    writer.write(out)
+    return out.getvalue()
+
+
+def _analyze_page(client, data: bytes, page_num: int) -> str:
+    """One Azure call for one page. Module-level so tests can patch it
+    directly, without needing to fake Azure's actual wire protocol."""
+    from azure.ai.documentintelligence.models import AnalyzeDocumentRequest, DocumentContentFormat
+
+    poller = client.begin_analyze_document(
+        "prebuilt-layout",
+        AnalyzeDocumentRequest(bytes_source=_single_page_pdf(data, page_num)),
+        output_content_format=DocumentContentFormat.MARKDOWN,
+    )
+    return poller.result().content
 
 
 def _multipart(boundary: str, options: str, filename: str, data: bytes) -> bytes:
