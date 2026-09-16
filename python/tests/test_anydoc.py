@@ -5,11 +5,14 @@ import io
 import json
 import os
 import threading
+import time
 import unittest
 import zipfile
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import anydoc
 
@@ -22,6 +25,13 @@ ZIPBOMB = FIXTURES / "abuse" / "zipbomb--errors.docx"
 MIXED = FIXTURES / "pdf" / "handmade-mixed.pdf"
 
 HOSTED_MARKDOWN = "# Read by the hosted parser\n"
+
+try:
+    import azure.ai.documentintelligence  # noqa: F401
+
+    _AZURE_EXTRA_INSTALLED = True
+except ImportError:
+    _AZURE_EXTRA_INSTALLED = False
 
 
 @contextmanager
@@ -59,6 +69,88 @@ def hosted_stub(status, body):
                 os.environ.pop(name, None)
             else:
                 os.environ[name] = value
+
+
+@contextmanager
+def azure_env(endpoint="https://example.cognitiveservices.azure.com/", key="fake-key"):
+    """Sets (or, if None, clears) the two Azure env vars, restoring whatever
+    was there after."""
+    names = ("AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT", "AZURE_DOCUMENT_INTELLIGENCE_KEY")
+    saved = {name: os.environ.pop(name, None) for name in names}
+    if endpoint is not None:
+        os.environ["AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT"] = endpoint
+    if key is not None:
+        os.environ["AZURE_DOCUMENT_INTELLIGENCE_KEY"] = key
+    try:
+        yield
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+@contextmanager
+def azure_stub(analyze):
+    """A stand-in for `DocumentIntelligenceClient`, patched at its origin
+    module so `_analyze_page`'s lazy import picks it up. `analyze(page_bytes)
+    -> str` runs once per Azure call with the single-page PDF bytes
+    `_analyze_page` actually built and sent (real `_single_page_pdf`
+    extraction is not mocked, so it's exercised for real); its return value
+    becomes that call's `result.content`, or if it raises, that call fails.
+    Yields the list of each call's (start, end) wall-clock span, for
+    checking real concurrency rather than just "it was fast"."""
+    import azure.ai.documentintelligence as adi
+
+    spans = []
+    lock = threading.Lock()
+
+    class _FakePoller:
+        def __init__(self, content):
+            self._content = content
+
+        def result(self):
+            return SimpleNamespace(content=self._content)
+
+    class _FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def begin_analyze_document(self, model, request, **kwargs):
+            start = time.monotonic()
+            content = analyze(request.bytes_source)
+            with lock:
+                spans.append((start, time.monotonic()))
+            return _FakePoller(content)
+
+    with patch.object(adi, "DocumentIntelligenceClient", _FakeClient):
+        yield spans
+
+
+def _blank_pdf(num_pages: int) -> bytes:
+    """A real, valid multi-page PDF with no content -- enough for
+    `_single_page_pdf` to slice and `pdf_inspector` to read, without needing
+    a committed fixture file. Content is irrelevant to the orchestration/
+    concurrency tests that use this; the Azure call itself is always mocked."""
+    from pypdf import PdfWriter
+
+    writer = PdfWriter()
+    for _ in range(num_pages):
+        writer.add_blank_page(width=200, height=200)
+    out = io.BytesIO()
+    writer.write(out)
+    return out.getvalue()
+
+
+def _max_overlap(spans: list[tuple[float, float]]) -> int:
+    """Max number of (start, end) intervals active at the same instant."""
+    events = sorted((t, delta) for start, end in spans for t, delta in ((start, 1), (end, -1)))
+    current = peak = 0
+    for _, delta in events:
+        current += delta
+        peak = max(peak, current)
+    return peak
 
 
 class AnydocTest(unittest.TestCase):
@@ -163,6 +255,103 @@ class AnydocTest(unittest.TestCase):
         self.assertEqual(stubbed, exported)
         # __init__.py re-exports the whole module, plus what it adds itself.
         self.assertEqual(set(anydoc.__all__), exported | {"Format", "HostedError", "AzureError", "Ocr"})
+
+
+@unittest.skipUnless(_AZURE_EXTRA_INSTALLED, "azure extra not installed")
+class AzureOcrTest(unittest.TestCase):
+    """Layer 2a/2b from the Azure OCR test plan: our own dispatch logic,
+    mocked at the `DocumentIntelligenceClient` boundary. Never calls the
+    real Azure service -- Layer 2c (real Azure behavior) is a separate,
+    deliberately deferred question, not covered here."""
+
+    def test_no_azure_config_raises_the_original_needs_ocr_error_unchanged(self):
+        with azure_env(endpoint=None, key=None):
+            with self.assertRaises(anydoc.NeedsOcrError) as caught:
+                anydoc.to_markdown(MIXED)
+            self.assertEqual(caught.exception.pages, [2])
+
+    def test_partial_config_raises_azure_error_immediately(self):
+        with azure_env(endpoint="https://example.cognitiveservices.azure.com/", key=None):
+            with self.assertRaisesRegex(anydoc.AzureError, "both.*set; only one is"):
+                anydoc.to_markdown_bytes(MIXED.read_bytes())
+        with azure_env(endpoint=None, key="fake-key"):
+            with self.assertRaisesRegex(anydoc.AzureError, "both.*set; only one is"):
+                anydoc.to_markdown_bytes(MIXED.read_bytes())
+
+    def test_ocr_hosted_wins_even_when_azure_is_configured(self):
+        reply = {"success": True, "data": {"markdown": HOSTED_MARKDOWN}}
+        with azure_env(), hosted_stub(200, reply) as hits, patch("anydoc._parse_azure") as mock_azure:
+            result = anydoc.to_markdown(MIXED, ocr="hosted")
+            self.assertEqual(result, HOSTED_MARKDOWN)
+            mock_azure.assert_not_called()
+            self.assertEqual(hits, [("/v2/parse", True)])
+
+    def test_azure_replaces_only_the_flagged_page(self):
+        with azure_env(), azure_stub(lambda page_bytes: "AZURE OCR TEXT\n"):
+            result = anydoc.to_markdown_bytes(MIXED.read_bytes())
+        self.assertIn("Text on the first page", result)  # untouched native page
+        self.assertIn("AZURE OCR TEXT", result)  # the flagged page, replaced
+
+    def test_extra_not_installed_raises_a_clean_azure_error(self):
+        with azure_env(), patch.dict("sys.modules", {"azure.ai.documentintelligence": None}):
+            with self.assertRaisesRegex(anydoc.AzureError, r"pip install firecrawl-anydoc\[azure\]"):
+                anydoc.to_markdown_bytes(MIXED.read_bytes())
+
+    def test_page_number_outside_the_document_raises_azure_error_not_indexerror(self):
+        fake_error = SimpleNamespace(pages=[99], page_count=2)
+        with azure_env(), azure_stub(lambda page_bytes: "irrelevant"):
+            with self.assertRaises(anydoc.AzureError) as caught:
+                anydoc._parse_azure(MIXED.read_bytes(), fake_error)
+            self.assertNotIsInstance(caught.exception, IndexError)
+
+    def test_empty_pages_list_returns_the_document_unchanged(self):
+        fake_error = SimpleNamespace(pages=[], page_count=2)
+
+        def fail_if_called(page_bytes):
+            self.fail("should not call Azure for an empty page list")
+
+        with azure_env(), azure_stub(fail_if_called):
+            result = anydoc._parse_azure(MIXED.read_bytes(), fake_error)
+        self.assertIn("Text on the first page", result)
+
+    def test_pages_dispatch_in_parallel_and_none_are_dropped(self):
+        n = 10  # > max_workers (8), so this also covers the queueing case
+        data = _blank_pdf(n)
+        fake_error = SimpleNamespace(pages=list(range(1, n + 1)), page_count=n)
+
+        def slow_analyze(page_bytes):
+            time.sleep(0.2)
+            return "ok"
+
+        with azure_env():
+            t0 = time.monotonic()
+            with azure_stub(slow_analyze) as spans:
+                anydoc._parse_azure(data, fake_error)
+            elapsed = time.monotonic() - t0
+
+        self.assertEqual(len(spans), n)  # every page dispatched exactly once
+        # Serial would take n * 0.2s = 2.0s; 8-way parallel should finish in
+        # two batches, ~0.4s. Generous bound against CI jitter.
+        self.assertLess(elapsed, 1.0, f"took {elapsed:.2f}s -- looks serial, not parallel")
+        self.assertGreater(_max_overlap(spans), 1, "no real overlap between calls")
+
+    def test_one_page_failing_fails_the_whole_call(self):
+        data = _blank_pdf(3)
+        fake_error = SimpleNamespace(pages=[1, 2, 3], page_count=3)
+        calls = {"n": 0}
+        lock = threading.Lock()
+
+        def flaky_analyze(page_bytes):
+            with lock:
+                calls["n"] += 1
+                this_call = calls["n"]
+            if this_call == 2:
+                raise RuntimeError("simulated Azure failure")
+            return "ok"
+
+        with azure_env(), azure_stub(flaky_analyze):
+            with self.assertRaisesRegex(anydoc.AzureError, "simulated Azure failure"):
+                anydoc._parse_azure(data, fake_error)
 
 
 if __name__ == "__main__":
