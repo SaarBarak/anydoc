@@ -32,25 +32,44 @@ unlike `pdf-inspector`'s (see that repo's `FORK.md`).
    by the merge commit below).
 6. `6191de9` — test: refresh a stale Persian-script test snapshot.
 7. `480d783` — Merge upstream/main (v0.2.4) and repoint the fork at
-   `pdf-inspector` 1.17.0 — most recent sync + pin bump; current tip of
-   `rtl-fix`.
+   `pdf-inspector` 1.17.0 — most recent sync + pin bump.
 
 ## Branch
 
-`rtl-fix` is the one long-lived branch — it accumulates every patch/pin-bump
-this fork carries. Don't create a new differently-named branch for the next
-change; branch off `rtl-fix`, merge back into it, re-tag.
+**`develop`** is the one long-lived branch — it accumulates every
+patch/pin-bump this fork carries, and releases are tagged directly off it
+(there is no separate release branch; `main` never receives these commits
+— see below). Renamed from `rtl-fix` (item 4 above renamed it from
+"in-house" to "rtl-fix"; that name described the *first* patch, not what
+the branch actually is now that it carries unrelated changes too — hence
+`develop`).
+
+**Working on it, including in parallel:** never commit directly to
+`develop`. Cut a short-lived branch off it per patch/feature, merge back
+via PR when it's done, then re-tag. That's what makes concurrent work by
+more than one person safe on a single branch — `develop`'s tip is always
+either fully done or not yet touched, never half-finished.
+
+**`main` stays a plain, untouched mirror of upstream** — not a merge
+target for `develop`. It has no fork commits and isn't meant to gain any;
+it's just an honest "here's vanilla upstream" landing page.
+
+**When to introduce a second branch (a `main-fork` line):** only if either
+(a) someone needs to cut a release while another patch is genuinely
+mid-flight and can't be merged or set aside, as a recurring situation, or
+(b) two deployments need to diverge onto different, separately-maintained
+patch sets. Neither applies today — don't create one preemptively.
 
 ## If `pdf-inspector` cuts a new patch tag
 
-Bump the `[patch.crates-io]` pin in `Cargo.toml` on `rtl-fix` to the new tag.
-This repo's own test suite doesn't cover Hebrew — the real regression gate is
-`tests/test_document_parser.py` in `SysAgentsHarness`. Tag the result
-`vX.Y.Z-rtl-fix.N` once that passes.
+Bump the `[patch.crates-io]` pin in `Cargo.toml` on `develop` to the new
+tag. This repo's own test suite doesn't cover Hebrew — the real regression
+gate is `tests/test_document_parser.py` in `SysAgentsHarness`. Tag the
+result `vX.Y.Z-rtl-fix.N` once that passes.
 
 ## If we ever need a newer anydoc upstream base
 
-Move `upstream-base` to the new commit, rebase `rtl-fix` onto it. None of our
-commits touch anydoc's own extraction logic — only `Cargo.toml`, CI, and
-docs — so this should be close to conflict-free regardless of how far
+Move `upstream-base` to the new commit, rebase `develop` onto it. None of
+our commits touch anydoc's own extraction logic — only `Cargo.toml`, CI,
+and docs — so this should be close to conflict-free regardless of how far
 upstream has moved.
