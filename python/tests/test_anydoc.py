@@ -162,7 +162,7 @@ class AnydocTest(unittest.TestCase):
         exported = {name for name in dir(anydoc._anydoc) if not name.startswith("_")}
         self.assertEqual(stubbed, exported)
         # __init__.py re-exports the whole module, plus what it adds itself.
-        self.assertEqual(set(anydoc.__all__), exported | {"Format", "HostedError", "Ocr"})
+        self.assertEqual(set(anydoc.__all__), exported | {"Format", "HostedError", "AzureError", "Ocr"})
 
 
 if __name__ == "__main__":

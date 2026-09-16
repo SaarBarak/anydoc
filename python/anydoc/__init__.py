@@ -5,6 +5,7 @@ import os
 import urllib.error
 import urllib.request
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Literal
@@ -47,13 +48,24 @@ via `format_from_bytes` or `format_from_extension`."""
 
 Ocr = Literal["reject", "hosted"]
 """What happens to a PDF whose pages need OCR. `reject` (the default) raises
-`NeedsOcrError` naming the pages. `hosted` sends the whole document to
-Firecrawl Parse instead, keyless unless a key is given. Documents anydoc
-converts itself never leave the machine."""
+`NeedsOcrError` naming the pages -- unless Azure Document Intelligence is
+configured (`AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT` and `_KEY` both set), in
+which case only those pages are recovered via Azure instead, and the rest of
+the document is untouched. `hosted` sends the whole document to Firecrawl
+Parse instead, keyless unless a key is given, regardless of Azure
+configuration. Documents anydoc converts itself never leave the machine
+unless one of these applies.
+
+Azure requires the `azure` extra: `pip install firecrawl-anydoc[azure]`."""
 
 
 class HostedError(ConvertError):
     """`ocr="hosted"` could not get the document through Firecrawl Parse."""
+
+
+class AzureError(ConvertError):
+    """Azure Document Intelligence could not recover the pages that need
+    OCR, or `AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT`/`_KEY` are misconfigured."""
 
 
 def to_markdown(
@@ -72,11 +84,13 @@ def to_markdown(
     `https://api.firecrawl.dev`."""
     try:
         return _to_markdown(path)
-    except NeedsOcrError:
-        if ocr != "hosted":
-            raise
-    path = Path(path)
-    return _parse_hosted(path.read_bytes(), path.name, api_key, api_url)
+    except NeedsOcrError as error:
+        if ocr == "hosted":
+            path = Path(path)
+            return _parse_hosted(path.read_bytes(), path.name, api_key, api_url)
+        if _azure_requested():
+            return _parse_azure(Path(path).read_bytes(), error)
+        raise
 
 
 def to_markdown_bytes(
@@ -93,10 +107,12 @@ def to_markdown_bytes(
     `to_markdown`."""
     try:
         return _to_markdown_bytes(data, format)
-    except NeedsOcrError:
-        if ocr != "hosted":
-            raise
-    return _parse_hosted(bytes(data), "document.pdf", api_key, api_url)
+    except NeedsOcrError as error:
+        if ocr == "hosted":
+            return _parse_hosted(bytes(data), "document.pdf", api_key, api_url)
+        if _azure_requested():
+            return _parse_azure(bytes(data), error)
+        raise
 
 
 _API_URL = "https://api.firecrawl.dev"
@@ -135,6 +151,75 @@ def _parse_hosted(data: bytes, filename: str, api_key: "str | None", api_url: "s
     if not isinstance(markdown, str) or not markdown:
         raise HostedError("Firecrawl Parse returned no Markdown")
     return markdown if markdown.endswith("\n") else markdown + "\n"
+
+
+_AZURE_ENDPOINT_ENV = "AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT"
+_AZURE_KEY_ENV = "AZURE_DOCUMENT_INTELLIGENCE_KEY"
+_AZURE_MAX_WORKERS = 8
+
+
+def _azure_requested() -> bool:
+    """Whether Azure looks configured at all -- checked before `_parse_azure`
+    so a caller with neither variable set gets the original `NeedsOcrError`
+    (unchanged behavior) instead of an Azure-specific error about a service
+    they never asked for."""
+    return bool(os.environ.get(_AZURE_ENDPOINT_ENV) or os.environ.get(_AZURE_KEY_ENV))
+
+
+# Only the pages NeedsOcrError named go to Azure, not the whole document:
+# unlike Parse, prebuilt-layout takes a page selection. One job per page,
+# never a page range -- output_content_format=MARKDOWN returns one joined
+# string per job with no documented per-page span boundary, so a multi-page
+# result can't be safely split back apart afterward.
+def _parse_azure(data: bytes, error: NeedsOcrError) -> str:
+    endpoint = os.environ.get(_AZURE_ENDPOINT_ENV)
+    key = os.environ.get(_AZURE_KEY_ENV)
+    if not endpoint or not key:
+        raise AzureError(
+            f"Azure Document Intelligence needs both {_AZURE_ENDPOINT_ENV} "
+            f"and {_AZURE_KEY_ENV} set; only one is"
+        )
+    try:
+        from azure.ai.documentintelligence import DocumentIntelligenceClient
+        from azure.ai.documentintelligence.models import (
+            AnalyzeDocumentRequest,
+            DocumentContentFormat,
+        )
+        from azure.core.credentials import AzureKeyCredential
+        import pdf_inspector
+    except ImportError as exc:
+        raise AzureError(
+            "Azure Document Intelligence OCR requires the 'azure' extra: "
+            "pip install firecrawl-anydoc[azure]"
+        ) from exc
+
+    client = DocumentIntelligenceClient(endpoint, AzureKeyCredential(key))
+    # Unrestricted read of every page's native text, in document order --
+    # the pages needing OCR (error.pages) come only from anydoc's own
+    # restricted check, never re-derived from this array.
+    pages = pdf_inspector.extract_pages_markdown_bytes(data).pages
+    merged = [page.markdown for page in pages]
+
+    def _ocr_page(page_num: int) -> str:
+        poller = client.begin_analyze_document(
+            "prebuilt-layout",
+            AnalyzeDocumentRequest(bytes_source=data),
+            pages=str(page_num),
+            output_content_format=DocumentContentFormat.MARKDOWN,
+        )
+        return poller.result().content
+
+    try:
+        with ThreadPoolExecutor(max_workers=_AZURE_MAX_WORKERS) as pool:
+            results = list(pool.map(_ocr_page, error.pages))
+    except Exception as exc:
+        raise AzureError(f"Azure Document Intelligence: {exc}") from exc
+
+    for page_num, markdown in zip(error.pages, results):
+        merged[page_num - 1] = markdown  # error.pages is 1-indexed, merged is 0-indexed
+
+    joined = "\n\n".join(merged)
+    return joined if joined.endswith("\n") else joined + "\n"
 
 
 def _multipart(boundary: str, options: str, filename: str, data: bytes) -> bytes:
@@ -182,6 +267,7 @@ def _version() -> str:
 
 __all__ = [
     "Asset",
+    "AzureError",
     "Block",
     "Cell",
     "CellSlot",

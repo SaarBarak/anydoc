@@ -21,6 +21,17 @@ classifiers = [
 # The version comes from Cargo.toml `package.version`.
 dynamic = ["version"]
 
+# Optional: `ocr="reject"` (the default) recovers pages via Azure Document
+# Intelligence instead of raising, when AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT
+# and _KEY are set. Kept optional so the base install stays dependency-free
+# for everyone not using it. Plain version constraint, no fork git URL --
+# same reasoning as Cargo.toml's `[patch.crates-io]` comment: avoids
+# upstream-merge conflicts; a consumer wanting the RTL-fixed pdf-inspector
+# fork build pins it themselves (e.g. `[tool.uv.sources]`), same as they
+# already do for this package itself.
+[project.optional-dependencies]
+azure = ["azure-ai-documentintelligence>=1.0.2", "pdf-inspector>=1.17.0"]
+
 [project.urls]
 Homepage = "https://github.com/firecrawl/anydoc#readme"
 Repository = "https://github.com/firecrawl/anydoc"
