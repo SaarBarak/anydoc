@@ -5,7 +5,9 @@ import os
 import urllib.error
 import urllib.request
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from importlib.metadata import PackageNotFoundError, version
+from io import BytesIO
 from pathlib import Path
 from typing import Literal
 
@@ -37,6 +39,9 @@ from anydoc._anydoc import (
 )
 from anydoc._anydoc import to_markdown as _to_markdown
 from anydoc._anydoc import to_markdown_bytes as _to_markdown_bytes
+from anydoc.ocr_clients.azure_di import AzureDiClient
+from anydoc.ocr_clients.azure_di import is_requested as _azure_requested
+from anydoc.ocr_clients.base import ClientConfigError
 
 Format = Literal[
     "doc", "docx", "odt", "pdf", "ppt", "pptx", "rtf", "epub", "xlsx", "ods", "odp", "csv"
@@ -47,13 +52,24 @@ via `format_from_bytes` or `format_from_extension`."""
 
 Ocr = Literal["reject", "hosted"]
 """What happens to a PDF whose pages need OCR. `reject` (the default) raises
-`NeedsOcrError` naming the pages. `hosted` sends the whole document to
-Firecrawl Parse instead, keyless unless a key is given. Documents anydoc
-converts itself never leave the machine."""
+`NeedsOcrError` naming the pages -- unless Azure Document Intelligence is
+configured (`AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT` and `_KEY` both set), in
+which case only those pages are recovered via Azure instead, and the rest of
+the document is untouched. `hosted` sends the whole document to Firecrawl
+Parse instead, keyless unless a key is given, regardless of Azure
+configuration. Documents anydoc converts itself never leave the machine
+unless one of these applies.
+
+Azure requires the `azure` extra: `pip install firecrawl-anydoc[azure]`."""
 
 
 class HostedError(ConvertError):
     """`ocr="hosted"` could not get the document through Firecrawl Parse."""
+
+
+class AzureError(ConvertError):
+    """Azure Document Intelligence could not recover the pages that need
+    OCR, or `AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT`/`_KEY` are misconfigured."""
 
 
 def to_markdown(
@@ -72,11 +88,13 @@ def to_markdown(
     `https://api.firecrawl.dev`."""
     try:
         return _to_markdown(path)
-    except NeedsOcrError:
-        if ocr != "hosted":
-            raise
-    path = Path(path)
-    return _parse_hosted(path.read_bytes(), path.name, api_key, api_url)
+    except NeedsOcrError as error:
+        if ocr == "hosted":
+            path = Path(path)
+            return _parse_hosted(path.read_bytes(), path.name, api_key, api_url)
+        if _azure_requested():
+            return _parse_azure(Path(path).read_bytes(), error)
+        raise
 
 
 def to_markdown_bytes(
@@ -93,10 +111,12 @@ def to_markdown_bytes(
     `to_markdown`."""
     try:
         return _to_markdown_bytes(data, format)
-    except NeedsOcrError:
-        if ocr != "hosted":
-            raise
-    return _parse_hosted(bytes(data), "document.pdf", api_key, api_url)
+    except NeedsOcrError as error:
+        if ocr == "hosted":
+            return _parse_hosted(bytes(data), "document.pdf", api_key, api_url)
+        if _azure_requested():
+            return _parse_azure(bytes(data), error)
+        raise
 
 
 _API_URL = "https://api.firecrawl.dev"
@@ -135,6 +155,87 @@ def _parse_hosted(data: bytes, filename: str, api_key: "str | None", api_url: "s
     if not isinstance(markdown, str) or not markdown:
         raise HostedError("Firecrawl Parse returned no Markdown")
     return markdown if markdown.endswith("\n") else markdown + "\n"
+
+
+_AZURE_MAX_WORKERS = 8
+
+
+# Only the pages NeedsOcrError named go to Azure, not the whole document:
+# unlike Parse, prebuilt-layout takes a page selection. One job per page,
+# never a page range -- see AzureDiClient.ocr_page for why.
+def _parse_azure(data: bytes, error: NeedsOcrError) -> str:
+    try:
+        client = AzureDiClient.from_env()
+    except ClientConfigError as exc:
+        raise AzureError(str(exc)) from exc
+
+    try:
+        import pdf_inspector
+    except ImportError as exc:
+        raise AzureError(
+            "Azure Document Intelligence OCR requires the 'azure' extra: "
+            "pip install firecrawl-anydoc[azure]"
+        ) from exc
+
+    # Unrestricted read of every page's native text, in document order --
+    # the pages needing OCR (error.pages) come only from anydoc's own
+    # restricted check, never re-derived from this array.
+    pages = pdf_inspector.extract_pages_markdown_bytes(data).pages
+    merged = [page.markdown for page in pages]
+
+    try:
+        with ThreadPoolExecutor(max_workers=_AZURE_MAX_WORKERS) as pool:
+            results = list(pool.map(lambda p: client.ocr_page(_single_page_pdf(data, p)), error.pages))
+    except Exception as exc:
+        raise AzureError(f"Azure Document Intelligence: {exc}") from exc
+
+    for page_num, markdown in zip(error.pages, results):
+        merged[page_num - 1] = markdown  # error.pages is 1-indexed, merged is 0-indexed
+
+    joined = "\n\n".join(merged)
+    return joined if joined.endswith("\n") else joined + "\n"
+
+
+def _single_page_pdf(data: bytes, page_num: int) -> bytes:
+    """Slices out page_num (1-indexed) as its own single-page PDF. Azure
+    size-limits the whole uploaded payload before `pages=` is ever applied --
+    confirmed live: a 5.1MB, 138-page document was rejected outright asking
+    for one page. Sending only that page's own bytes keeps every request
+    small regardless of source size. Module-level (not nested in
+    `_parse_azure`) so tests can call or patch it directly.
+
+    Known limitations, not yet addressed:
+    - Fixes the whole-document case only. A single page can in principle
+      still be too large on its own (e.g. one very high-resolution scan) --
+      that surfaces as a generic AzureError via _parse_azure's exception
+      wrapper (see test_a_still_oversized_single_page_raises_a_clean_azure_error),
+      not a distinct, more actionable one.
+    - Azure's documented size ceiling (checked against current Microsoft
+      docs): 4MB per request on the free F0 tier, 500MB on paid S0 -- the
+      5.1MB failure this fix was verified against lines up almost exactly
+      with F0's ceiling, suggesting (not confirmed) the resource used in
+      testing is F0. F0 also caps at 500 pages/month total across the whole
+      resource and only processes the first 2 pages of any multi-page
+      upload -- for real production volume, that monthly cap is a bigger
+      constraint than file size ever was, and worth a real answer from
+      whoever owns the Azure subscription before this ships, independent of
+      anything in this code. This fix's one-page-per-request shape sidesteps
+      F0's 2-page restriction as a side effect, not a deliberate design goal.
+    - Re-parses the entire source document from scratch once per flagged
+      page, each in its own thread -- cost scales with page count times
+      document size. Kept this way deliberately (an independent parse per
+      thread avoids sharing a PdfReader across threads, which isn't
+      documented as thread-safe), but it's an unverified tradeoff, not a
+      measured one. Untested under real stress (many flagged pages in a
+      very large document)."""
+    from pypdf import PdfReader, PdfWriter
+
+    reader = PdfReader(BytesIO(data))
+    writer = PdfWriter()
+    writer.add_page(reader.pages[page_num - 1])
+    out = BytesIO()
+    writer.write(out)
+    return out.getvalue()
 
 
 def _multipart(boundary: str, options: str, filename: str, data: bytes) -> bytes:
@@ -182,6 +283,7 @@ def _version() -> str:
 
 __all__ = [
     "Asset",
+    "AzureError",
     "Block",
     "Cell",
     "CellSlot",
