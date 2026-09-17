@@ -231,8 +231,17 @@ def _single_page_pdf(data: bytes, page_num: int) -> bytes:
       that surfaces as a generic AzureError via _parse_azure's exception
       wrapper (see test_a_still_oversized_single_page_raises_a_clean_azure_error),
       not a distinct, more actionable one.
-    - Azure's actual documented size ceiling was never looked up; only one
-      failing data point is confirmed (5.1MB, whole document, pre-fix).
+    - Azure's documented size ceiling (checked against current Microsoft
+      docs): 4MB per request on the free F0 tier, 500MB on paid S0 -- the
+      5.1MB failure this fix was verified against lines up almost exactly
+      with F0's ceiling, suggesting (not confirmed) the resource used in
+      testing is F0. F0 also caps at 500 pages/month total across the whole
+      resource and only processes the first 2 pages of any multi-page
+      upload -- for real production volume, that monthly cap is a bigger
+      constraint than file size ever was, and worth a real answer from
+      whoever owns the Azure subscription before this ships, independent of
+      anything in this code. This fix's one-page-per-request shape sidesteps
+      F0's 2-page restriction as a side effect, not a deliberate design goal.
     - Re-parses the entire source document from scratch once per flagged
       page, each in its own thread -- cost scales with page count times
       document size. Kept this way deliberately (an independent parse per
