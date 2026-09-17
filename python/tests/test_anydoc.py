@@ -353,6 +353,28 @@ class AzureOcrTest(unittest.TestCase):
             with self.assertRaisesRegex(anydoc.AzureError, "simulated Azure failure"):
                 anydoc._parse_azure(data, fake_error)
 
+    def test_a_still_oversized_single_page_raises_a_clean_azure_error(self):
+        """_single_page_pdf fixes the whole-document size limit (confirmed
+        live against a real 5.1MB document -- see _single_page_pdf's
+        docstring), but a single page can in principle still be too large
+        on its own after extraction. A real oversized fixture is
+        disproportionate for a unit test, so this simulates Azure's actual
+        observed rejection shape for that case (HttpResponseError,
+        InvalidContentLength -- the exact error hit live earlier against the
+        unfixed whole-document case) and confirms it still surfaces as a
+        clean AzureError, not a raw azure.core exception leaking through."""
+        from azure.core.exceptions import HttpResponseError
+
+        def oversized_rejection(page_bytes):
+            raise HttpResponseError("(InvalidRequest) Invalid request. InvalidContentLength: The input image is too large.")
+
+        fake_error = SimpleNamespace(pages=[2], page_count=2)
+        with azure_env(), azure_stub(oversized_rejection):
+            with self.assertRaises(anydoc.AzureError) as caught:
+                anydoc._parse_azure(MIXED.read_bytes(), fake_error)
+            self.assertNotIsInstance(caught.exception, HttpResponseError)
+            self.assertIn("InvalidContentLength", str(caught.exception))
+
 
 if __name__ == "__main__":
     unittest.main()
