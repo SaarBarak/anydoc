@@ -223,7 +223,23 @@ def _single_page_pdf(data: bytes, page_num: int) -> bytes:
     confirmed live: a 5.1MB, 138-page document was rejected outright asking
     for one page. Sending only that page's own bytes keeps every request
     small regardless of source size. Module-level (not nested in
-    `_parse_azure`) so tests can call or patch it directly."""
+    `_parse_azure`) so tests can call or patch it directly.
+
+    Known limitations, not yet addressed:
+    - Fixes the whole-document case only. A single page can in principle
+      still be too large on its own (e.g. one very high-resolution scan) --
+      that surfaces as a generic AzureError via _parse_azure's exception
+      wrapper (see test_a_still_oversized_single_page_raises_a_clean_azure_error),
+      not a distinct, more actionable one.
+    - Azure's actual documented size ceiling was never looked up; only one
+      failing data point is confirmed (5.1MB, whole document, pre-fix).
+    - Re-parses the entire source document from scratch once per flagged
+      page, each in its own thread -- cost scales with page count times
+      document size. Kept this way deliberately (an independent parse per
+      thread avoids sharing a PdfReader across threads, which isn't
+      documented as thread-safe), but it's an unverified tradeoff, not a
+      measured one. Untested under real stress (many flagged pages in a
+      very large document)."""
     from pypdf import PdfReader, PdfWriter
 
     reader = PdfReader(BytesIO(data))
