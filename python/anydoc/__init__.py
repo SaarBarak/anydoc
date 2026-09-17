@@ -39,6 +39,9 @@ from anydoc._anydoc import (
 )
 from anydoc._anydoc import to_markdown as _to_markdown
 from anydoc._anydoc import to_markdown_bytes as _to_markdown_bytes
+from anydoc.ocr_clients.azure_di import AzureDiClient
+from anydoc.ocr_clients.azure_di import is_requested as _azure_requested
+from anydoc.ocr_clients.base import ClientConfigError
 
 Format = Literal[
     "doc", "docx", "odt", "pdf", "ppt", "pptx", "rtf", "epub", "xlsx", "ods", "odp", "csv"
@@ -154,42 +157,19 @@ def _parse_hosted(data: bytes, filename: str, api_key: "str | None", api_url: "s
     return markdown if markdown.endswith("\n") else markdown + "\n"
 
 
-_AZURE_ENDPOINT_ENV = "AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT"
-_AZURE_KEY_ENV = "AZURE_DOCUMENT_INTELLIGENCE_KEY"
 _AZURE_MAX_WORKERS = 8
-
-
-def _azure_requested() -> bool:
-    """Whether Azure looks configured at all -- checked before `_parse_azure`
-    so a caller with neither variable set gets the original `NeedsOcrError`
-    (unchanged behavior) instead of an Azure-specific error about a service
-    they never asked for."""
-    return bool(os.environ.get(_AZURE_ENDPOINT_ENV) or os.environ.get(_AZURE_KEY_ENV))
 
 
 # Only the pages NeedsOcrError named go to Azure, not the whole document:
 # unlike Parse, prebuilt-layout takes a page selection. One job per page,
-# never a page range -- output_content_format=MARKDOWN returns one joined
-# string per job with no documented per-page span boundary, so a multi-page
-# result can't be safely split back apart afterward.
+# never a page range -- see AzureDiClient.ocr_page for why.
 def _parse_azure(data: bytes, error: NeedsOcrError) -> str:
-    endpoint = os.environ.get(_AZURE_ENDPOINT_ENV)
-    key = os.environ.get(_AZURE_KEY_ENV)
-    if not endpoint or not key:
-        raise AzureError(
-            f"Azure Document Intelligence needs both {_AZURE_ENDPOINT_ENV} "
-            f"and {_AZURE_KEY_ENV} set; only one is"
-        )
     try:
-        # Re-imported by _single_page_pdf/_analyze_page too (each is
-        # independently self-contained for testing) -- importing everything
-        # here as well means a missing package fails fast, before any real
-        # work, with this one friendly message rather than a wrapped one
-        # from inside a worker thread.
-        from azure.ai.documentintelligence import DocumentIntelligenceClient
-        from azure.ai.documentintelligence.models import AnalyzeDocumentRequest, DocumentContentFormat  # noqa: F401
-        from azure.core.credentials import AzureKeyCredential
-        from pypdf import PdfReader, PdfWriter  # noqa: F401
+        client = AzureDiClient.from_env()
+    except ClientConfigError as exc:
+        raise AzureError(str(exc)) from exc
+
+    try:
         import pdf_inspector
     except ImportError as exc:
         raise AzureError(
@@ -197,7 +177,6 @@ def _parse_azure(data: bytes, error: NeedsOcrError) -> str:
             "pip install firecrawl-anydoc[azure]"
         ) from exc
 
-    client = DocumentIntelligenceClient(endpoint, AzureKeyCredential(key))
     # Unrestricted read of every page's native text, in document order --
     # the pages needing OCR (error.pages) come only from anydoc's own
     # restricted check, never re-derived from this array.
@@ -206,7 +185,7 @@ def _parse_azure(data: bytes, error: NeedsOcrError) -> str:
 
     try:
         with ThreadPoolExecutor(max_workers=_AZURE_MAX_WORKERS) as pool:
-            results = list(pool.map(lambda p: _analyze_page(client, data, p), error.pages))
+            results = list(pool.map(lambda p: client.ocr_page(_single_page_pdf(data, p)), error.pages))
     except Exception as exc:
         raise AzureError(f"Azure Document Intelligence: {exc}") from exc
 
@@ -257,19 +236,6 @@ def _single_page_pdf(data: bytes, page_num: int) -> bytes:
     out = BytesIO()
     writer.write(out)
     return out.getvalue()
-
-
-def _analyze_page(client, data: bytes, page_num: int) -> str:
-    """One Azure call for one page. Module-level so tests can patch it
-    directly, without needing to fake Azure's actual wire protocol."""
-    from azure.ai.documentintelligence.models import AnalyzeDocumentRequest, DocumentContentFormat
-
-    poller = client.begin_analyze_document(
-        "prebuilt-layout",
-        AnalyzeDocumentRequest(bytes_source=_single_page_pdf(data, page_num)),
-        output_content_format=DocumentContentFormat.MARKDOWN,
-    )
-    return poller.result().content
 
 
 def _multipart(boundary: str, options: str, filename: str, data: bytes) -> bytes:
