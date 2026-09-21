@@ -162,19 +162,8 @@ _AZURE_MAX_WORKERS = 8
 
 # `data` is guaranteed to be PDF bytes here, not just assumed: NeedsOcr is
 # raised in exactly one place in the whole Rust core, src/formats/pdf.rs --
-# no other format parser (docx, pptx, doc, ppt, odf, rtf, epub, sheet, csv)
-# has any such logic, so this function can only ever be reached via a PDF.
-#
-# Separate finding, not addressed here: a docx/pptx that's genuinely just a
-# scanned image with no real text runs never raises NeedsOcrError at all --
-# anydoc's docx/pptx parser just successfully extracts nothing (there's
-# nothing to extract), and doc-parser reports that as status="empty" by
-# checking the output content after the fact (see SysAgentsHarness's
-# catalog/skills/doc_parser/scripts/run.py), not by catching an exception.
-# That silently bypasses this whole OCR mechanism -- Azure, ocr="hosted",
-# all of it -- regardless of configuration, for any non-PDF format. This is
-# a structural scope boundary of anydoc's current architecture, not a bug
-# in this function.
+# no other format parser has any such logic, so this function can only
+# ever be reached via a PDF.
 #
 # Only the pages NeedsOcrError named go to Azure, not the whole document:
 # unlike Parse, prebuilt-layout takes a page selection. One job per page,
