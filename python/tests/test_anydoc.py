@@ -375,6 +375,31 @@ class AzureOcrTest(unittest.TestCase):
             self.assertNotIsInstance(caught.exception, HttpResponseError)
             self.assertIn("InvalidContentLength", str(caught.exception))
 
+    def test_verify_single_page_accepts_one_page_rejects_more(self):
+        """Unit test of ocr_clients.base.verify_single_page in isolation,
+        against real PDF bytes -- not mocked, since pypdf's own page count
+        is exactly what's being trusted here."""
+        from anydoc.ocr_clients.base import verify_single_page
+
+        verify_single_page(_blank_pdf(1))  # does not raise
+
+        with self.assertRaisesRegex(ValueError, "expected exactly one page, got 2"):
+            verify_single_page(_blank_pdf(2))
+
+    def test_a_regressed_single_page_pdf_fails_the_call_instead_of_silently_corrupting(self):
+        """The actual point of verify_single_page: if _single_page_pdf (or
+        any future replacement) ever regressed to producing more than one
+        page, dispatch must fail loudly, not silently merge a multi-page
+        Azure result into a single array slot. Proven by making
+        _single_page_pdf actually misbehave (not simulated at a distance),
+        confirming both that it fails, and that it fails as AzureError."""
+        fake_error = SimpleNamespace(pages=[2], page_count=2)
+
+        with azure_env(), azure_stub(lambda page_bytes: "should never be reached"):
+            with patch("anydoc._single_page_pdf", return_value=_blank_pdf(2)):
+                with self.assertRaisesRegex(anydoc.AzureError, "expected exactly one page, got 2"):
+                    anydoc._parse_azure(MIXED.read_bytes(), fake_error)
+
 
 if __name__ == "__main__":
     unittest.main()

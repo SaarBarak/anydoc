@@ -41,7 +41,7 @@ from anydoc._anydoc import to_markdown as _to_markdown
 from anydoc._anydoc import to_markdown_bytes as _to_markdown_bytes
 from anydoc.ocr_clients.azure_di import AzureDiClient
 from anydoc.ocr_clients.azure_di import is_requested as _azure_requested
-from anydoc.ocr_clients.base import ClientConfigError
+from anydoc.ocr_clients.base import ClientConfigError, verify_single_page
 
 Format = Literal[
     "doc", "docx", "odt", "pdf", "ppt", "pptx", "rtf", "epub", "xlsx", "ods", "odp", "csv"
@@ -160,6 +160,22 @@ def _parse_hosted(data: bytes, filename: str, api_key: "str | None", api_url: "s
 _AZURE_MAX_WORKERS = 8
 
 
+# `data` is guaranteed to be PDF bytes here, not just assumed: NeedsOcr is
+# raised in exactly one place in the whole Rust core, src/formats/pdf.rs --
+# no other format parser (docx, pptx, doc, ppt, odf, rtf, epub, sheet, csv)
+# has any such logic, so this function can only ever be reached via a PDF.
+#
+# Separate finding, not addressed here: a docx/pptx that's genuinely just a
+# scanned image with no real text runs never raises NeedsOcrError at all --
+# anydoc's docx/pptx parser just successfully extracts nothing (there's
+# nothing to extract), and doc-parser reports that as status="empty" by
+# checking the output content after the fact (see SysAgentsHarness's
+# catalog/skills/doc_parser/scripts/run.py), not by catching an exception.
+# That silently bypasses this whole OCR mechanism -- Azure, ocr="hosted",
+# all of it -- regardless of configuration, for any non-PDF format. This is
+# a structural scope boundary of anydoc's current architecture, not a bug
+# in this function.
+#
 # Only the pages NeedsOcrError named go to Azure, not the whole document:
 # unlike Parse, prebuilt-layout takes a page selection. One job per page,
 # never a page range -- see AzureDiClient.ocr_page for why.
@@ -183,9 +199,14 @@ def _parse_azure(data: bytes, error: NeedsOcrError) -> str:
     pages = pdf_inspector.extract_pages_markdown_bytes(data).pages
     merged = [page.markdown for page in pages]
 
+    def _dispatch(page_num: int) -> str:
+        page_bytes = _single_page_pdf(data, page_num)
+        verify_single_page(page_bytes)
+        return client.ocr_page(page_bytes)
+
     try:
         with ThreadPoolExecutor(max_workers=_AZURE_MAX_WORKERS) as pool:
-            results = list(pool.map(lambda p: client.ocr_page(_single_page_pdf(data, p)), error.pages))
+            results = list(pool.map(_dispatch, error.pages))
     except Exception as exc:
         raise AzureError(f"Azure Document Intelligence: {exc}") from exc
 
