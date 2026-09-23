@@ -375,26 +375,23 @@ class AzureOcrTest(unittest.TestCase):
                 anydoc.to_markdown_bytes(MIXED.read_bytes())
 
     def test_page_number_outside_the_document_raises_azure_error_not_indexerror(self):
-        fake_error = SimpleNamespace(pages=[99], page_count=2)
         with azure_env(), azure_stub(lambda page_bytes: "irrelevant"):
             with self.assertRaises(anydoc.OcrError) as caught:
-                anydoc._parse_ocr(MIXED.read_bytes(), fake_error)
+                anydoc._parse_ocr(MIXED.read_bytes(), [99])
             self.assertNotIsInstance(caught.exception, IndexError)
 
     def test_empty_pages_list_returns_the_document_unchanged(self):
-        fake_error = SimpleNamespace(pages=[], page_count=2)
 
         def fail_if_called(page_bytes):
             self.fail("should not call Azure for an empty page list")
 
         with azure_env(), azure_stub(fail_if_called):
-            result = anydoc._parse_ocr(MIXED.read_bytes(), fake_error)
+            result = anydoc._parse_ocr(MIXED.read_bytes(), [])
         self.assertIn("Text on the first page", result)
 
     def test_pages_dispatch_in_parallel_and_none_are_dropped(self):
         n = 10  # > max_workers (8), so this also covers the queueing case
         data = _blank_pdf(n)
-        fake_error = SimpleNamespace(pages=list(range(1, n + 1)), page_count=n)
 
         def slow_analyze(page_bytes):
             time.sleep(0.2)
@@ -403,7 +400,7 @@ class AzureOcrTest(unittest.TestCase):
         with azure_env():
             t0 = time.monotonic()
             with azure_stub(slow_analyze) as spans:
-                anydoc._parse_ocr(data, fake_error)
+                anydoc._parse_ocr(data, list(range(1, n + 1)))
             elapsed = time.monotonic() - t0
 
         self.assertEqual(len(spans), n)  # every page dispatched exactly once
@@ -414,7 +411,6 @@ class AzureOcrTest(unittest.TestCase):
 
     def test_one_page_failing_fails_the_whole_call(self):
         data = _blank_pdf(3)
-        fake_error = SimpleNamespace(pages=[1, 2, 3], page_count=3)
         calls = {"n": 0}
         lock = threading.Lock()
 
@@ -428,7 +424,7 @@ class AzureOcrTest(unittest.TestCase):
 
         with azure_env(), azure_stub(flaky_analyze):
             with self.assertRaisesRegex(anydoc.OcrError, "simulated Azure failure"):
-                anydoc._parse_ocr(data, fake_error)
+                anydoc._parse_ocr(data, [1, 2, 3])
 
     def test_a_still_oversized_single_page_raises_a_clean_azure_error(self):
         """_single_page_pdf fixes the whole-document size limit (confirmed
@@ -445,10 +441,9 @@ class AzureOcrTest(unittest.TestCase):
         def oversized_rejection(page_bytes):
             raise HttpResponseError("(InvalidRequest) Invalid request. InvalidContentLength: The input image is too large.")
 
-        fake_error = SimpleNamespace(pages=[2], page_count=2)
         with azure_env(), azure_stub(oversized_rejection):
             with self.assertRaises(anydoc.OcrError) as caught:
-                anydoc._parse_ocr(MIXED.read_bytes(), fake_error)
+                anydoc._parse_ocr(MIXED.read_bytes(), [2])
             self.assertNotIsInstance(caught.exception, HttpResponseError)
             self.assertIn("InvalidContentLength", str(caught.exception))
 
@@ -470,25 +465,23 @@ class AzureOcrTest(unittest.TestCase):
         it must fail before paying Azure for the other pages."""
         import pdf_inspector
 
-        fake_error = SimpleNamespace(pages=[1], page_count=3)
         pages = self._fake_pages(("", None), ("native text\n", None), ("", "vector_text"))
 
         with azure_env(), azure_stub(lambda page_bytes: self.fail("should not reach Azure")):
             with patch.object(pdf_inspector, "extract_pages_markdown_bytes", return_value=pages):
                 with self.assertRaisesRegex(anydoc.OcrError, r"pages \[3\].*vector_text"):
-                    anydoc._parse_ocr(_blank_pdf(3), fake_error)
+                    anydoc._parse_ocr(_blank_pdf(3), [1])
 
     def test_a_genuinely_blank_page_is_not_mistaken_for_a_wiped_one(self):
         """A blank page reports `needs_ocr` too, but states no reason. The
         guard above must not reject a document for containing one."""
         import pdf_inspector
 
-        fake_error = SimpleNamespace(pages=[1], page_count=3)
         pages = self._fake_pages(("", None), ("native text\n", None), ("", None))
 
         with azure_env(), azure_stub(lambda page_bytes: "OCR OF PAGE ONE\n"):
             with patch.object(pdf_inspector, "extract_pages_markdown_bytes", return_value=pages):
-                result = anydoc._parse_ocr(_blank_pdf(3), fake_error)
+                result = anydoc._parse_ocr(_blank_pdf(3), [1])
         self.assertIn("OCR OF PAGE ONE", result)
         self.assertIn("native text", result)
 
@@ -522,15 +515,109 @@ class AzureOcrTest(unittest.TestCase):
         Azure result into a single array slot. Proven by making
         _single_page_pdf actually misbehave (not simulated at a distance),
         confirming both that it fails, and that it fails as OcrError."""
-        fake_error = SimpleNamespace(pages=[2], page_count=2)
 
         with azure_env(), azure_stub(lambda page_bytes: "should never be reached"):
             with patch("anydoc._single_page_pdf", return_value=_blank_pdf(2)):
                 with self.assertRaisesRegex(anydoc.OcrError, "expected exactly one page, got 2"):
-                    anydoc._parse_ocr(MIXED.read_bytes(), fake_error)
+                    anydoc._parse_ocr(MIXED.read_bytes(), [2])
 
 
 @unittest.skipUnless(_PDF_LIBS_INSTALLED, "pdf-inspector/pypdf not installed")
+@unittest.skipUnless(_AZURE_EXTRA_INSTALLED, "azure extra not installed")
+class RoutingTest(unittest.TestCase):
+    """Page health decides which pages go to OCR; `_parse_ocr` merges whatever
+    it is handed. These cover the seam between them."""
+
+    def test_a_conversion_that_did_not_raise_is_still_scanned_and_routed(self):
+        """The case the whole feature exists for, and the easiest to leave
+        untested: the core's check fires only when a page yields nothing at
+        all, so a page whose glyphs became outlines renders perfectly,
+        extracts as nothing, and never raises. The real 95-page tender does
+        exactly this -- `pages_needing_ocr: []`, converts "successfully", 14
+        pages short.
+
+        No committed fixture reproduces it. The handmade PDFs all trip
+        `NeedsOcrError` (`handmade-outlined` raises for pages 2-3), because
+        none of them reproduces the *detection* short-circuit that makes the
+        tender succeed: `PdfType::TextBased` hard-codes `pages_needing_ocr`
+        empty without running a per-page check. So the clean conversion is
+        simulated here, and the real document was verified by hand -- 53
+        pages routed, page 25 recovered. A fixture that reproduces it would
+        be worth having."""
+        import anydoc.page_health as page_health
+
+        data = FIXTURES / "pdf" / "text.pdf"
+        health = [SimpleNamespace(page=1, needs_ocr=True)]
+        with azure_env():
+            with patch("anydoc._to_markdown_bytes", return_value="native\n"):
+                with patch.object(page_health, "scan_pdf_health", return_value=health):
+                    with azure_stub(lambda page_bytes: "OCR TEXT\n") as spans:
+                        result = anydoc.to_markdown_bytes(data.read_bytes())
+        self.assertEqual(len(spans), 1, "a clean conversion was not routed")
+        self.assertIn("OCR TEXT", result)
+
+    def test_nothing_is_scanned_when_no_engine_is_configured(self):
+        """The zero-cost promise: a caller who never asked for OCR pays for no
+        scan and gets byte-identical output."""
+        import anydoc.page_health as page_health
+
+        data = (FIXTURES / "pdf" / "text.pdf").read_bytes()
+        with azure_env(endpoint=None, key=None):
+            with patch.object(page_health, "scan_pdf_health") as scan:
+                before = anydoc.to_markdown_bytes(data)
+                scan.assert_not_called()
+            after = anydoc.to_markdown_bytes(data)
+        self.assertEqual(before, after)
+
+    def test_a_non_pdf_is_never_scanned(self):
+        """`NeedsOcr` is raised in one place in the Rust core, and page health
+        reads PDF content streams. Neither applies to a docx."""
+        import anydoc.page_health as page_health
+
+        with azure_env():
+            with patch.object(page_health, "scan_pdf_health") as scan:
+                anydoc.to_markdown_bytes(RICH.read_bytes())
+                scan.assert_not_called()
+
+    def test_a_failing_scan_does_not_break_a_working_conversion(self):
+        """Fails open, deliberately. A scan is an opinion about a document
+        that already converted; a bug in forming that opinion must not take
+        the conversion down with it."""
+        import anydoc.page_health as page_health
+
+        data = (FIXTURES / "pdf" / "text.pdf").read_bytes()
+        with azure_env():
+            with patch.object(page_health, "scan_pdf_health", side_effect=RuntimeError("scan bug")):
+                with azure_stub(lambda page_bytes: self.fail("should not reach Azure")):
+                    result = anydoc.to_markdown_bytes(data)
+        self.assertEqual(result, anydoc.to_markdown_bytes(data))
+
+    def test_the_two_detectors_are_unioned_not_replaced(self):
+        """The core catches a page with no text at all; page health catches a
+        page that renders perfectly and extracts as nothing. A document with
+        both must send both, or whichever detector ran second silently wins.
+        `handmade-mixed` raises for its scanned page 2; health is made to
+        flag page 1 as well."""
+        import anydoc.page_health as page_health
+
+        health = [SimpleNamespace(page=1, needs_ocr=True), SimpleNamespace(page=2, needs_ocr=False)]
+        with azure_env():
+            with patch.object(page_health, "scan_pdf_health", return_value=health):
+                with azure_stub(lambda page_bytes: "OCR\n") as spans:
+                    anydoc.to_markdown_bytes(MIXED.read_bytes())
+        self.assertEqual(len(spans), 2, "expected the core's page 2 and health's page 1")
+
+    def test_hosted_still_wins_and_skips_the_scan_entirely(self):
+        import anydoc.page_health as page_health
+
+        reply = {"success": True, "data": {"markdown": HOSTED_MARKDOWN}}
+        with azure_env(), hosted_stub(200, reply):
+            with patch.object(page_health, "scan_pdf_health") as scan:
+                result = anydoc.to_markdown(MIXED, ocr="hosted")
+                scan.assert_not_called()
+        self.assertEqual(result, HOSTED_MARKDOWN)
+
+
 class PageHealthTest(unittest.TestCase):
     """Per-page extraction-health signals.
 
