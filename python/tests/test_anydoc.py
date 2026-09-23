@@ -25,6 +25,7 @@ CSV = FIXTURES / "csv" / "sheet.csv"
 ENCRYPTED = FIXTURES / "malformed" / "encrypted--errors.odt"
 ZIPBOMB = FIXTURES / "abuse" / "zipbomb--errors.docx"
 MIXED = FIXTURES / "pdf" / "handmade-mixed.pdf"
+OUTLINED = FIXTURES / "pdf" / "handmade-outlined.pdf"
 
 HOSTED_MARKDOWN = "# Read by the hosted parser\n"
 
@@ -41,6 +42,16 @@ try:
     _PDF_INSPECTOR_INSTALLED = True
 except ImportError:
     _PDF_INSPECTOR_INSTALLED = False
+
+# page_health needs the extra's PDF libraries but not the Azure SDK, so it
+# gets its own guard rather than riding on _AZURE_EXTRA_INSTALLED. It needs
+# pypdf on top of what the pin check above already probed.
+try:
+    import pypdf  # noqa: F401
+
+    _PDF_LIBS_INSTALLED = _PDF_INSPECTOR_INSTALLED
+except ImportError:
+    _PDF_LIBS_INSTALLED = False
 
 
 @contextmanager
@@ -517,6 +528,94 @@ class AzureOcrTest(unittest.TestCase):
             with patch("anydoc._single_page_pdf", return_value=_blank_pdf(2)):
                 with self.assertRaisesRegex(anydoc.OcrError, "expected exactly one page, got 2"):
                     anydoc._parse_ocr(MIXED.read_bytes(), fake_error)
+
+
+@unittest.skipUnless(_PDF_LIBS_INSTALLED, "pdf-inspector/pypdf not installed")
+class PageHealthTest(unittest.TestCase):
+    """Per-page extraction-health signals.
+
+    `handmade-outlined.pdf` is three pages built for this: a clean text page,
+    a page whose body is drawn as filled Bezier curves (text converted to
+    outlines, unrecoverable without OCR), and a heavily ruled table page that
+    loses nothing. The ruled page is the control -- a curve-based signal that
+    also fires on table borders is useless on the documents we actually
+    ingest, which are wall-to-wall ruled tables."""
+
+    @classmethod
+    def setUpClass(cls):
+        from anydoc.page_health import scan_pdf_health
+
+        cls.pages = scan_pdf_health(OUTLINED.read_bytes())
+
+    def test_the_ratio_counts_only_characters_that_failed_to_map(self):
+        from anydoc.page_health import cmap_corruption_ratio
+
+        self.assertEqual(cmap_corruption_ratio(""), 0.0)
+        self.assertEqual(cmap_corruption_ratio("ordinary prose"), 0.0)
+        # Hebrew is not corruption; a signal that flags it would route every
+        # RTL document to OCR.
+        self.assertEqual(cmap_corruption_ratio("עיריית תל אביב"), 0.0)
+        self.assertGreater(cmap_corruption_ratio("abd"), 0.0)
+        self.assertGreater(cmap_corruption_ratio("ab�d"), 0.0)
+        # A (cid:N) token is ten characters of junk in the output, not one,
+        # so it is counted by length.
+        self.assertGreater(cmap_corruption_ratio("(cid:45)xy"), 0.5)
+
+    def test_a_clean_page_raises_nothing(self):
+        clean = self.pages[0]
+        self.assertEqual(clean.curve_ops, 0)
+        self.assertEqual(clean.reasons, [])
+        self.assertFalse(clean.needs_ocr)
+
+    def test_outlined_text_is_flagged_and_routes_to_ocr(self):
+        outlined = self.pages[1]
+        self.assertGreaterEqual(outlined.curve_ops, 500)
+        self.assertIn("outlined_text", outlined.reasons)
+        self.assertTrue(outlined.needs_ocr)
+
+    def test_a_ruled_table_page_is_not_mistaken_for_outlined_text(self):
+        """The control. Table rules are straight lines and rectangles and
+        emit no curve operator at all, so the same quantity of vector ink
+        drawn as borders must not route the page to OCR."""
+        ruled = self.pages[2]
+        self.assertEqual(ruled.curve_ops, 0)
+        self.assertNotIn("outlined_text", ruled.reasons)
+        self.assertFalse(ruled.needs_ocr)
+
+    def test_a_wiped_page_is_repaired_from_native_text_not_sent_to_ocr(self):
+        """pdf-inspector blanks a page's Markdown whenever its own per-page
+        check fires, discarding good body text with it (upstream #252/#342).
+        That text is still readable through the positions API, so a wipe is
+        a free repair and must never, on its own, spend an OCR call."""
+        wiped = [page for page in self.pages if page.markdown_wiped]
+        self.assertTrue(wiped, "fixture no longer reproduces the upstream wipe")
+        for page in wiped:
+            self.assertEqual(page.markdown_chars, 0)
+            self.assertTrue(page.native_text.strip(), "nothing recovered to repair with")
+            if "outlined_text" not in page.reasons:
+                self.assertFalse(
+                    page.needs_ocr,
+                    "a wipe alone must not route to OCR -- the text is recoverable free",
+                )
+
+    def test_image_placeholders_do_not_count_as_extracted_text(self):
+        """The positions API reports images as `[Image: ...]` pseudo-text.
+        Counting it makes an empty page look like it has content: a real
+        tender's cover page scored 74 such characters while carrying no
+        readable text at all, and its outlined title was lost silently."""
+        from anydoc.page_health import _real_text
+
+        items = [
+            SimpleNamespace(text="[Image: Im1]", item_type="image"),
+            SimpleNamespace(text="   ", item_type="text"),
+        ]
+        self.assertEqual(_real_text(items).strip(), "")
+
+    def test_every_page_reports_its_signals_whether_or_not_it_is_flagged(self):
+        for page, number in zip(self.pages, (1, 2, 3)):
+            self.assertEqual(page.page, number)  # 1-indexed, matching NeedsOcrError
+            self.assertIsInstance(page.curve_ops, int)
+            self.assertIsInstance(page.cmap_corruption_ratio, float)
 
 
 if __name__ == "__main__":
