@@ -126,8 +126,9 @@ the branch actually is now that it carries unrelated changes too — hence
 `develop`).
 
 **Working on it, including in parallel:** never commit directly to
-`develop`. Cut a short-lived branch off it per patch/feature, merge back
-via PR when it's done, then re-tag. That's what makes concurrent work by
+`develop`. Cut a short-lived branch off it per patch/feature, run the gates
+yourself (see "Before you open a PR" — CI will not run them for you), merge
+back via PR when it's done, then re-tag. That's what makes concurrent work by
 more than one person safe on a single branch — `develop`'s tip is always
 either fully done or not yet touched, never half-finished.
 
@@ -140,6 +141,74 @@ it's just an honest "here's vanilla upstream" landing page.
 mid-flight and can't be merged or set aside, as a recurring situation, or
 (b) two deployments need to diverge onto different, separately-maintained
 patch sets. Neither applies today — don't create one preemptively.
+
+## Before you open a PR: run the gates locally
+
+**CI is not a gate on this fork, and never has been.** `ci.yml` asks for
+`blacksmith-8vcpu-ubuntu-2404`, a third-party runner label that no runner
+attached to this repository answers, so every CI run sits queued until
+something cancels it. The "canceling since a higher priority waiting request
+exists" message a push produces is the concurrency rule tidying up runs that
+were never going to start — a symptom, not the cause. Across a recent 40-run
+window here: 14 cancelled, 4 still queued, 2 succeeded, and both successes are
+`RTL-fix wheels`, the one workflow that asks for `ubuntu-latest`. `release.yml`
+has the same label and the same fate.
+
+This is accepted rather than fixed. The fork exists to carry patches, not to
+host a build farm, and repointing those labels means editing a file upstream
+owns for no benefit to the thing we actually ship. **So the gate is you, before
+you open the PR.** Run what the corresponding CI job would have run, and say in
+the PR what you ran.
+
+| What you changed | Run |
+|---|---|
+| Anything at all | `cargo fmt --all --check` |
+| Any Rust | `cargo clippy --workspace --all-targets --all-features -- -D warnings` and `cargo test --locked` |
+| Anything under `tests/fixtures/` | `cargo test --locked` — see the snapshot note below |
+| Any Python | the Python block below, **both ways** |
+| `node/`, `wasm/` | the `node` and `wasm` jobs in `ci.yml`; nothing in this fork has needed them yet |
+
+The Python job, reproduced exactly:
+
+```bash
+maturin build --release --locked --manifest-path python/Cargo.toml --out dist
+uv venv /tmp/ci-venv                       # or python -m venv
+uv pip install --python /tmp/ci-venv/bin/python --no-index --find-links dist firecrawl-anydoc
+cd <repo root>                             # NOT python/ -- see below
+/tmp/ci-venv/bin/python -m unittest discover -s python/tests
+```
+
+**Run the Python suite both ways, because the two disagree about what runs.**
+CI installs with no extras, so 23 of the 35 tests skip — every Azure test,
+every page-health test, and the installed-package half of `ForkPinTest`. A
+clean-venv pass proves the package imports and the static checks hold; it
+proves almost nothing about the OCR code. Run it again in a venv with
+`[azure]` installed to actually exercise that.
+
+Four things that have each cost real time:
+
+- **Run the Python tests from the repo root, never from `python/`.** With
+  `python/` as the working directory the source `anydoc/` package dir shadows
+  the installed compiled module, and you test the wrong thing. `ci.yml` carries
+  the same warning.
+- **Adding any file under `tests/fixtures/` requires a snapshot.**
+  `tests/snapshots.rs` walks the whole corpus and snapshots each conversion, so
+  a new fixture fails `cargo test` until its snapshot is recorded. `cargo insta
+  accept` does it; without `cargo-insta` installed, take the `.snap.new` insta
+  wrote, delete its `assertion_line:` field, and rename it to `.snap`. **Read
+  what it recorded** — a snapshot accepted without reading is a test that
+  asserts whatever the bug does.
+- **The venv can be stale.** A Hebrew check once "failed" against an install
+  still holding PyPI `1.20.0`, long after both pins were correct.
+  `ForkPinTest` now catches exactly this, but only if you run it in the venv
+  you are actually using.
+- **`--locked` means `Cargo.lock` must already be current.** If a dependency
+  moved, commit the lockfile in the same PR.
+
+Hebrew is still not covered by anything here. The real regression gate is
+`tests/test_document_parser.py` in `SysAgentsHarness`, with
+`dev/test_documents/bidi_bench/` as a second, synthetic RTL/math/Unicode case.
+Run it before a pin bump.
 
 ## If `pdf-inspector` cuts a new patch tag
 
@@ -167,7 +236,9 @@ OCR dispatch changed that: `anydoc/__init__.py` and `python/pyproject.toml`
 both carry fork edits, and upstream owns both files. `anydoc/ocr_clients/`
 is ours alone and should not conflict.
 
-Two checks the rebase is not done without:
+Run the full local gate afterwards, not just the Python suite — a rebase is
+exactly when a snapshot or a lockfile goes stale. Two checks it is not done
+without:
 
 - `python/tests/test_anydoc.py`, which covers the OCR dispatch's own logic
   against a mocked Azure client;
