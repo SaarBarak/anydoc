@@ -2232,10 +2232,53 @@ TEXT_PAGE = b"BT /F1 24 Tf 72 700 Td (Text on the first page) Tj ET"
 IMAGE_PAGE = b"q 468 0 0 648 72 72 cm /Im1 Do Q"
 
 
+# Text converted to outlines at export time ("convert to curves" in a design
+# tool, transparency flattening, a font that may not be embedded) leaves filled
+# Bezier paths behind: no font, no character code, no text-showing operator.
+# The page renders normally and extracts as nothing. Table rules and cell
+# borders are straight lines and rectangles and produce no curve operator at
+# all -- that asymmetry is the only thing separating the two cases, so the
+# ruled page below is the negative control that keeps a curve-based signal
+# honest.
+def glyph_paths(count, top=680):
+    """`count` filled blobs of glyph size, two `c` operators each."""
+    out = []
+    for i in range(count):
+        x, y = 72 + (i % 40) * 12, top - (i // 40) * 16
+        out.append(b"%d %d m %d %d %d %d %d %d c %d %d %d %d %d %d c f"
+                   % (x, y, x + 2, y + 6, x + 7, y + 6, x + 9, y,
+                      x + 7, y - 4, x + 2, y - 4, x, y))
+    return b"\n".join(out)
+
+
+def rule_paths(count, top=680):
+    """`count` straight table rules: `m`/`l`/`re` only, never a `c`."""
+    out = []
+    for i in range(count):
+        y = top - (i % 40) * 16
+        x = 72 + (i // 40) * 120
+        out.append(b"%d %d m %d %d l S" % (x, y, x + 110, y))
+        out.append(b"%d %d 110 14 re S" % (x, y - 14))
+    return b"\n".join(out)
+
+
+# One line of genuine text over an outlined block: the shape of a real page
+# whose body survives extraction while one region silently does not.
+OUTLINED_PAGE = (b"BT /F1 12 Tf 72 720 Td (Heading that extracts normally) Tj ET\n"
+                 + glyph_paths(300))
+# The same amount of vector ink drawn as table borders. Nothing is lost here,
+# so any signal that flags this page is over-firing.
+RULED_PAGE = (b"BT /F1 12 Tf 72 720 Td (Ruled table page, nothing outlined) Tj ET\n"
+              + rule_paths(300))
+
+
 def ocr_pdfs():
     """A scan (image-only pages) and a mixed document (a text page then a scanned one)."""
     (OUT / "pdf" / "handmade-scanned.pdf").write_bytes(handmade_pdf([IMAGE_PAGE, IMAGE_PAGE]))
     (OUT / "pdf" / "handmade-mixed.pdf").write_bytes(handmade_pdf([TEXT_PAGE, IMAGE_PAGE]))
+    # page 1 clean, page 2 outlined, page 3 heavily ruled but intact.
+    (OUT / "pdf" / "handmade-outlined.pdf").write_bytes(
+        handmade_pdf([TEXT_PAGE, OUTLINED_PAGE, RULED_PAGE]))
 
 
 def main():
