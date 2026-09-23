@@ -375,6 +375,46 @@ class AzureOcrTest(unittest.TestCase):
             self.assertNotIsInstance(caught.exception, HttpResponseError)
             self.assertIn("InvalidContentLength", str(caught.exception))
 
+    def _fake_pages(self, *specs):
+        """Stands in for `extract_pages_markdown_bytes(...).pages`. Each spec
+        is (markdown, ocr_reason); pages are numbered 0-indexed in order, as
+        pdf-inspector numbers them."""
+        pages = [
+            SimpleNamespace(page=index, markdown=markdown, needs_ocr=not markdown.strip(), ocr_reason=reason)
+            for index, (markdown, reason) in enumerate(specs)
+        ]
+        return SimpleNamespace(pages=pages)
+
+    def test_an_unflagged_wiped_page_fails_the_call_instead_of_merging_empty(self):
+        """`extract_pages_markdown_bytes` blanks a page whose text it
+        distrusts. Until page health routes those pages to OCR they are not
+        in `error.pages`, so merging would silently drop real content -- the
+        one outcome this path must never produce. It must fail loudly, and
+        it must fail before paying Azure for the other pages."""
+        import pdf_inspector
+
+        fake_error = SimpleNamespace(pages=[1], page_count=3)
+        pages = self._fake_pages(("", None), ("native text\n", None), ("", "vector_text"))
+
+        with azure_env(), azure_stub(lambda page_bytes: self.fail("should not reach Azure")):
+            with patch.object(pdf_inspector, "extract_pages_markdown_bytes", return_value=pages):
+                with self.assertRaisesRegex(anydoc.AzureError, r"pages \[3\].*vector_text"):
+                    anydoc._parse_azure(_blank_pdf(3), fake_error)
+
+    def test_a_genuinely_blank_page_is_not_mistaken_for_a_wiped_one(self):
+        """A blank page reports `needs_ocr` too, but states no reason. The
+        guard above must not reject a document for containing one."""
+        import pdf_inspector
+
+        fake_error = SimpleNamespace(pages=[1], page_count=3)
+        pages = self._fake_pages(("", None), ("native text\n", None), ("", None))
+
+        with azure_env(), azure_stub(lambda page_bytes: "OCR OF PAGE ONE\n"):
+            with patch.object(pdf_inspector, "extract_pages_markdown_bytes", return_value=pages):
+                result = anydoc._parse_azure(_blank_pdf(3), fake_error)
+        self.assertIn("OCR OF PAGE ONE", result)
+        self.assertIn("native text", result)
+
     def test_verify_single_page_accepts_one_page_rejects_more(self):
         """Unit test of ocr_clients.base.verify_single_page in isolation,
         against real PDF bytes -- not mocked, since pypdf's own page count

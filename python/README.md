@@ -76,7 +76,7 @@ except (anydoc.EncryptedError, anydoc.UnsupportedError) as error:
 | `ResourceLimitError` | Crossed a fixed safety limit (decompression, nesting, node count)   |
 | `MissingPartError`   | A part required for any meaningful output is absent                 |
 | `HostedError`        | `ocr="hosted"` could not get the document through Firecrawl Parse   |
-| `AzureError`         | Azure Document Intelligence misconfigured or could not OCR the page |
+| `AzureError`         | Azure Document Intelligence misconfigured, could not OCR the page, or the document has pages whose text was dropped and not recovered |
 | `OSError`            | The file could not be read, from `to_markdown` only                 |
 
 Every conversion failure subclasses `anydoc.ConvertError`, so catching that handles all of them at once. `MalformedError.part` and `MissingPartError.part` name the package part at fault, `ResourceLimitError.limit` names the limit crossed, and `str(error)` carries the whole message. A `format` argument naming no supported format raises `ValueError`.
