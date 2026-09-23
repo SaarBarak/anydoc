@@ -27,11 +27,22 @@ B. `outlined_text` -- the page draws far more Bezier curves than its text
 C. `markdown_wiped` -- `extract_pages_markdown_bytes()` blanked a page whose
    text the positions API can still see. That is our toolchain over-reacting,
    not damage to the document (upstream firecrawl/pdf-inspector#252, #342).
-   Repaired for free from D; it never routes to OCR.
+   The text is still in the file, but it routes to OCR anyway: reading the
+   page again is cheaper than reassembling it from coordinates, and far more
+   reliable. See "why nothing is reconstructed here" below.
 
-D. `native_text` -- not a detector. Text recovered from the rawest extraction
-   path available, used as the repair for C, the input to A, and the fallback
-   when an OCR result is unusable.
+D. `text_present` -- not a detector. Whether the rawest extraction path sees
+   any characters at all, measured as `native_chars`. It is the input A and C
+   are computed from, and nothing else.
+
+Why nothing is reconstructed here: an earlier version rebuilt a page's text
+by sorting positioned items into approximate reading order, and used it to
+repair C for free. PDF stores text as positioned fragments with no spaces
+between them, so that join fused neighbours -- on a real tender it welded two
+table headers into `PROPOSALMINIMUM`, a token in no document. Inventing a
+token is no better than dropping one, so a page that is not cleanly readable
+now goes to OCR whole and the engine's output is taken as the page. This
+module decides *which* pages; it never produces their text.
 
 Not detected here: a scanner application's own bad OCR layer, which yields
 well-formed but semantically wrong text. Every signal above stays silent on
@@ -73,10 +84,13 @@ REASON_OUTLINED = "outlined_text"
 REASON_WIPED = "markdown_wiped"
 REASON_NO_TEXT = "no_extractable_text"
 
-# Reasons that mean characters are gone from the file and only reading the
-# rendered page can bring them back. `markdown_wiped` is deliberately absent:
-# that text is recoverable from `native_text` at no cost.
-_OCR_REASONS = frozenset({REASON_CMAP, REASON_OUTLINED, REASON_NO_TEXT})
+# Every reason routes to OCR. `markdown_wiped` was once excluded, on the
+# grounds that its text is still in the file and could be rebuilt locally at
+# no cost. Rebuilding it proved worse than re-reading it -- see "why nothing
+# is reconstructed here" -- so a wipe now spends an OCR call like the rest.
+# The set is kept rather than collapsed into `bool(reasons)`: it is where a
+# future reason that should *not* route gets expressed.
+_OCR_REASONS = frozenset({REASON_CMAP, REASON_OUTLINED, REASON_NO_TEXT, REASON_WIPED})
 
 
 @dataclass
@@ -87,21 +101,20 @@ class PageHealth:
     cmap_corruption_ratio: float
     curve_ops: int
     text_show_ops: int
-    native_text: str
+    native_chars: int
     markdown_chars: int
     has_ink: bool
     reasons: "list[str]" = field(default_factory=list)
 
     @property
     def needs_ocr(self) -> bool:
-        """Whether this page has to go to an OCR engine.
-
-        A wipe alone does not qualify -- see `_OCR_REASONS`."""
+        """Whether this page has to go to an OCR engine."""
         return any(reason in _OCR_REASONS for reason in self.reasons)
 
     @property
     def markdown_wiped(self) -> bool:
-        """Good text was discarded and should be restored from `native_text`."""
+        """Good text was discarded by our own toolchain. The page still goes
+        to OCR -- what is cheap to detect is not cheap to rebuild."""
         return REASON_WIPED in self.reasons
 
 
@@ -127,32 +140,7 @@ def _real_text(items) -> str:
     return _IMAGE_PLACEHOLDER.sub("", joined)
 
 
-def _ordered_text(items, direction: str = "auto") -> str:
-    """Join a page's items in approximate reading order.
-
-    `auto` switches to right-to-left when Hebrew or Arabic dominates, because
-    no field on `TextItem` reports direction (upstream
-    firecrawl/pdf-inspector#217). Assumes a single column: a genuine
-    multi-column page interleaves. Good enough for a fallback, not a
-    substitute for the real Markdown path."""
-    items = [item for item in items if "image" not in str(item.item_type).lower()]
-    if not items:
-        return ""
-    if direction == "auto":
-        total = sum(len(item.text) for item in items) or 1
-        rtl = sum(
-            1
-            for item in items
-            for ch in item.text
-            if "֐" <= ch <= "׿" or "؀" <= ch <= "ۿ"
-        )
-        direction = "rtl" if rtl / total > 0.3 else "ltr"
-    horizontal = (lambda i: -i.x) if direction == "rtl" else (lambda i: i.x)
-    ordered = sorted(items, key=lambda i: (-i.y, horizontal(i)))
-    return _IMAGE_PLACEHOLDER.sub("", "".join(item.text for item in ordered))
-
-
-def scan_pdf_health(data: bytes, direction: str = "auto") -> "list[PageHealth]":
+def scan_pdf_health(data: bytes) -> "list[PageHealth]":
     """Measure every page of `data`. Never raises for a readable PDF."""
     import pdf_inspector
     from io import BytesIO
@@ -170,7 +158,6 @@ def scan_pdf_health(data: bytes, direction: str = "auto") -> "list[PageHealth]":
     for index, page in enumerate(reader.pages):
         number = index + 1
         items = by_page.get(number, [])
-        native = _ordered_text(items, direction)
         real = _real_text(items).strip()
 
         try:
@@ -207,7 +194,7 @@ def scan_pdf_health(data: bytes, direction: str = "auto") -> "list[PageHealth]":
                 cmap_corruption_ratio=ratio,
                 curve_ops=curves,
                 text_show_ops=shows,
-                native_text=native,
+                native_chars=len(real),
                 markdown_chars=markdown_chars,
                 has_ink=has_ink,
                 reasons=reasons,

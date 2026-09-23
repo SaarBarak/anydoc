@@ -574,29 +574,34 @@ class PageHealthTest(unittest.TestCase):
         self.assertTrue(outlined.needs_ocr)
 
     def test_a_ruled_table_page_is_not_mistaken_for_outlined_text(self):
-        """The control. Table rules are straight lines and rectangles and
-        emit no curve operator at all, so the same quantity of vector ink
-        drawn as borders must not route the page to OCR."""
+        """The control, and the reason B is usable on a corpus of ruled
+        tables at all: table rules are straight lines and rectangles and emit
+        no curve operator, so the same quantity of vector ink drawn as borders
+        must not look like glyphs converted to paths.
+
+        This page does route to OCR -- pdf-inspector wipes it, so C fires --
+        but that is a different signal reaching a different conclusion for a
+        stated reason. What must never happen is B firing here."""
         ruled = self.pages[2]
         self.assertEqual(ruled.curve_ops, 0)
         self.assertNotIn("outlined_text", ruled.reasons)
-        self.assertFalse(ruled.needs_ocr)
+        self.assertEqual(ruled.reasons, ["markdown_wiped"])
 
-    def test_a_wiped_page_is_repaired_from_native_text_not_sent_to_ocr(self):
+    def test_a_wiped_page_routes_to_ocr_rather_than_being_rebuilt(self):
         """pdf-inspector blanks a page's Markdown whenever its own per-page
         check fires, discarding good body text with it (upstream #252/#342).
-        That text is still readable through the positions API, so a wipe is
-        a free repair and must never, on its own, spend an OCR call."""
+        The characters are still reachable through the positions API, so this
+        page could in principle be rebuilt locally -- and was, until that join
+        proved to fuse neighbouring fragments into tokens that exist in no
+        document. A wipe now routes to OCR like any other reason. The page
+        must still report that its text *is* present, because that is what
+        distinguishes a wipe from a genuinely empty page."""
         wiped = [page for page in self.pages if page.markdown_wiped]
         self.assertTrue(wiped, "fixture no longer reproduces the upstream wipe")
         for page in wiped:
             self.assertEqual(page.markdown_chars, 0)
-            self.assertTrue(page.native_text.strip(), "nothing recovered to repair with")
-            if "outlined_text" not in page.reasons:
-                self.assertFalse(
-                    page.needs_ocr,
-                    "a wipe alone must not route to OCR -- the text is recoverable free",
-                )
+            self.assertGreater(page.native_chars, 0, "a wipe means the text is still there")
+            self.assertTrue(page.needs_ocr, "a wipe must route to OCR, not be rebuilt")
 
     def test_image_placeholders_do_not_count_as_extracted_text(self):
         """The positions API reports images as `[Image: ...]` pseudo-text.
