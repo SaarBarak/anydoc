@@ -186,7 +186,7 @@ def _parse_azure(data: bytes, error: NeedsOcrError) -> str:
     # the pages needing OCR (error.pages) come only from anydoc's own
     # restricted check, never re-derived from this array.
     pages = pdf_inspector.extract_pages_markdown_bytes(data).pages
-    merged = [page.markdown for page in pages]
+    merged = [_page_markdown(page, data) for page in pages]
 
     def _dispatch(page_num: int) -> str:
         page_bytes = _single_page_pdf(data, page_num)
@@ -204,6 +204,49 @@ def _parse_azure(data: bytes, error: NeedsOcrError) -> str:
 
     joined = "\n\n".join(merged)
     return joined if joined.endswith("\n") else joined + "\n"
+
+
+def _page_markdown(page, data: bytes) -> str:
+    """A page's Markdown, recovering it when the extractor suppressed it.
+
+    `extract_pages_markdown_bytes` returns an empty string for every page its
+    own per-page check distrusts, discarding that page's text wholesale. The
+    check is page-wide, so one unreliable region -- a heading drawn as vector
+    outlines, say -- takes the whole page's body text with it even when that
+    text extracted perfectly (upstream firecrawl/pdf-inspector#252, #342).
+
+    That is survivable when the caller asked only for Markdown and got an
+    error. It is not survivable here: this function's whole job is to return
+    a complete document, and a page blanked this way would come back silently
+    empty, indistinguishable from a page that genuinely holds nothing.
+
+    The positioned-text API reads the same page through a different path with
+    no such suppression, so it still reports the items. Reading order is
+    approximated by position and carries no table structure -- worse than the
+    Markdown would have been, and far better than nothing."""
+    if page.markdown.strip():
+        return page.markdown
+    import pdf_inspector
+
+    items = [
+        item
+        for item in pdf_inspector.extract_text_with_positions_bytes(data)
+        if item.page == page.page + 1 and "image" not in str(item.item_type).lower()
+    ]
+    if not items:
+        return page.markdown
+    # Top-to-bottom, then right-to-left when the page is predominantly RTL:
+    # no field on the item reports direction (firecrawl/pdf-inspector#217),
+    # so it is inferred from the script actually present.
+    total = sum(len(item.text) for item in items) or 1
+    rtl = sum(
+        1
+        for item in items
+        for ch in item.text
+        if "֐" <= ch <= "׿" or "؀" <= ch <= "ۿ"
+    )
+    horizontal = (lambda i: -i.x) if rtl / total > 0.3 else (lambda i: i.x)
+    return "".join(item.text for item in sorted(items, key=lambda i: (-i.y, horizontal(i))))
 
 
 def _single_page_pdf(data: bytes, page_num: int) -> bytes:

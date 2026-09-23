@@ -2,11 +2,33 @@
 
 ## What this fork is for
 
-Redirects anydoc's PDF backend to a patched `pdf-inspector` build (see
-`SaarBarak/pdf-inspector`'s own `FORK.md`) that fixes Hebrew/RTL text
-extraction. **This fork's own Rust/Python source is unmodified from
-upstream** — every commit here is about wiring to the patched dependency
-and shipping installable wheels for it, not changing anydoc's own behavior.
+Two things now, and they have different costs to maintain.
+
+1. **Wiring.** Redirects anydoc's PDF backend to a patched `pdf-inspector`
+   build (see `SaarBarak/pdf-inspector`'s own `FORK.md`) that fixes
+   Hebrew/RTL text extraction. Cargo's `[patch.crates-io]` and the `azure`
+   extra's pin in `python/pyproject.toml` both name that fork's tag, and
+   both must move together — see "The pin is in two places" below.
+2. **Feature work.** Azure Document Intelligence OCR dispatch: when a PDF's
+   scanned pages would otherwise raise `NeedsOcrError`, they are recovered
+   page by page and merged back, and the rest of the document never leaves
+   the machine. This is anydoc's own Python source, changed here and not
+   upstream.
+
+**This fork used to say its own source was unmodified from upstream, and
+that rebasing was therefore close to conflict-free. That stopped being true
+when the OCR dispatch landed.** The claim is recorded here as it was, rather
+than quietly dropped, because the promise it made — cheap upstream
+rebases — is the thing that changed, and whoever does the next one should
+know before starting. Rebasing now means merging real changes to
+`anydoc/__init__.py`, `anydoc/ocr_clients/`, and `python/pyproject.toml`,
+not just re-applying a `Cargo.toml` block.
+
+That was a deliberate trade, not drift: upstream has no OCR escalation and
+no plans stated for one, and the pipeline consuming this fork needs Hebrew
+scanned pages read rather than rejected. Revisit it if upstream ever grows
+its own OCR path — at that point this feature work should move there and
+the fork can shrink back to wiring.
 
 ## Frozen base
 
@@ -33,6 +55,28 @@ unlike `pdf-inspector`'s (see that repo's `FORK.md`).
 6. `6191de9` — test: refresh a stale Persian-script test snapshot.
 7. `480d783` — Merge upstream/main (v0.2.4) and repoint the fork at
    `pdf-inspector` 1.17.0 — most recent sync + pin bump.
+
+8. Azure Document Intelligence OCR dispatch (`feat/azure-ocr-dispatch`) —
+   the first commits here to change anydoc's own behavior. Adds
+   `anydoc/ocr_clients/`, the `ocr="reject"` escalation in
+   `anydoc/__init__.py`, and the `azure` extra. See "What this fork is for".
+
+## The pin is in two places
+
+`pdf-inspector` is consumed twice, and both consumers resolve independently:
+
+| Consumer | Declared in | Resolves from |
+|---|---|---|
+| Rust core, links the crate | `Cargo.toml` `[patch.crates-io]` | the fork tag |
+| `_parse_azure`, imports the package | `python/pyproject.toml`, `azure` extra | the fork tag |
+
+They were not always both redirected. The Python side carried a plain
+`pdf-inspector>=1.17.0`, which resolves from PyPI — upstream, without the
+RTL fix — so one install held two versions of one library and Hebrew came
+back character-reversed from whichever path went through Python, in the
+fork that exists to prevent exactly that.
+
+**Move both together, always.** A bump that touches one is the bug.
 
 ## Branch
 
@@ -62,14 +106,30 @@ patch sets. Neither applies today — don't create one preemptively.
 
 ## If `pdf-inspector` cuts a new patch tag
 
-Bump the `[patch.crates-io]` pin in `Cargo.toml` on `develop` to the new
-tag. This repo's own test suite doesn't cover Hebrew — the real regression
-gate is `tests/test_document_parser.py` in `SysAgentsHarness`. Tag the
-result `vX.Y.Z-rtl-fix.N` once that passes.
+Bump **both** pins on `develop` to the new tag — `[patch.crates-io]` in
+`Cargo.toml` *and* the `azure` extra in `python/pyproject.toml`. Bumping
+only the first is the bug described in "The pin is in two places": the Rust
+core moves to the new fork build while the Python side keeps resolving
+upstream from PyPI, and Hebrew comes back reversed from the Azure path.
+
+This repo's own test suite doesn't cover Hebrew — the real regression gate
+is `tests/test_document_parser.py` in `SysAgentsHarness`. Tag the result
+`vX.Y.Z-rtl-fix.N` once that passes.
 
 ## If we ever need a newer anydoc upstream base
 
-Move `upstream-base` to the new commit, rebase `develop` onto it. None of
-our commits touch anydoc's own extraction logic — only `Cargo.toml`, CI,
-and docs — so this should be close to conflict-free regardless of how far
-upstream has moved.
+Move `upstream-base` to the new commit, rebase `develop` onto it.
+
+**Expect real conflicts now.** This used to be close to free, because no
+commit here touched anydoc's own code — only `Cargo.toml`, CI and docs. The
+OCR dispatch changed that: `anydoc/__init__.py` and `python/pyproject.toml`
+both carry fork edits, and upstream owns both files. `anydoc/ocr_clients/`
+is ours alone and should not conflict.
+
+Two checks the rebase is not done without:
+
+- `python/tests/test_anydoc.py`, which covers the OCR dispatch's own logic
+  against a mocked Azure client;
+- `SysAgentsHarness`'s `tests/test_document_parser.py`, the Hebrew gate —
+  this repo's suite does not cover Hebrew, and a rebase that silently drops
+  either pin is exactly the failure it catches.
