@@ -1,0 +1,5 @@
+---
+source: tests/snapshots.rs
+expression: output
+---
+ERROR: pages 2-3 of 3 need OCR
