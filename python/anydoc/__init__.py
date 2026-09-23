@@ -189,16 +189,25 @@ def _parse_hosted(data: bytes, filename: str, api_key: "str | None", api_url: "s
 
 
 def _health_pages(data: bytes) -> "list[int]":
-    """Pages `page_health` says need OCR, 1-indexed, or `[]`.
+    """Pages `page_health` says need OCR, 1-indexed.
 
     Runs only when an engine is configured, so a caller who never asked for
     OCR pays nothing and gets byte-identical output.
 
-    **Fails open.** A scan is an opinion about a document that already
-    converted; a bug in forming that opinion must never break a conversion
-    that worked. The cost of failing open is that a wiped page can go
-    unrouted, which `_parse_ocr`'s dropped-page guard then catches rather
-    than merging it away silently."""
+    **Fails loudly**, and that is the deliberate half. A scan that cannot run
+    means the document was never checked; returning it anyway asserts it is
+    healthy on no evidence, which is the silent success this whole path exists
+    to remove. The systematic case is worse than the single document: failing
+    open would let one bug switch page health off entirely while every tender
+    still came back looking fine, and nothing anywhere would say so.
+
+    The cost was measured before choosing it. The scan reads content streams
+    through `pypdf`, which is stricter than the `lopdf` the Rust core uses, so
+    a document can in principle convert and then fail to scan -- a damaged
+    `startxref` does exactly that. Across the 17 real PDFs in
+    `SysAgentsHarness`'s corpus, including 250- and 360-page tenders, **zero**
+    did. The one file that fails there fails in `to_markdown` first and never
+    reaches this."""
     if format_from_bytes(data) != "pdf":
         # `page_health` reads a PDF's content streams. Nothing else can be
         # scanned, and nothing else needs to be: `NeedsOcr` is raised in one
@@ -208,8 +217,11 @@ def _health_pages(data: bytes) -> "list[int]":
         from anydoc.page_health import scan_pdf_health
 
         return [page.page for page in scan_pdf_health(data) if page.needs_ocr]
-    except Exception:
-        return []
+    except Exception as exc:
+        raise OcrError(
+            f"page health could not assess this document, so whether it lost text "
+            f"is unknown: {type(exc).__name__}: {exc}"
+        ) from exc
 
 
 def _route(data: bytes, already_flagged: "list[int]") -> "list[int]":
@@ -264,41 +276,6 @@ def _parse_ocr(data: bytes, pages_needing_ocr: "list[int]", engine=None) -> str:
     # OCR instead of reconstructing it.
     pages = pdf_inspector.extract_pages_markdown_bytes(data).pages
     merged = [page.markdown for page in pages]
-
-    # Refuse to return a document already known to be incomplete, and refuse
-    # before spending anything on OCR for the pages that would have succeeded.
-    #
-    # This is not detection deciding what to OCR -- it routes nothing and
-    # flags nothing. It is the merge step declining to present a partial
-    # document as a whole one, which is the trade `ocr="reject"` makes
-    # everywhere else: for compliance content a loud failure beats a quiet
-    # gap.
-    #
-    # Page health now flags wiped pages, so in the ordinary case they arrive
-    # already routed and this cannot fire. It is kept for the one case where
-    # that is not true: `_health_pages` fails open, so a scan that raises
-    # leaves a wiped page unflagged, and without this the document would come
-    # back quietly missing it. A scan bug must not be able to cause silent
-    # data loss.
-    #
-    # Gated on a stated `ocr_reason`, not on emptiness: a genuinely blank
-    # page also reports `needs_ocr`, and failing on those would reject valid
-    # documents. A wiped page whose reason is unstated -- an outlined title
-    # below the curve floor, say -- still passes here; separating that from
-    # a blank page needs ink detection, which belongs with the other signals.
-    flagged = set(pages_needing_ocr)
-    dropped = [
-        page.page + 1
-        for page in pages
-        if page.page + 1 not in flagged and not page.markdown.strip() and page.ocr_reason
-    ]
-    if dropped:
-        raise OcrError(
-            f"pages {dropped} lost their text to pdf-inspector's own suppression "
-            f"and were not flagged for OCR; returning the document would drop them "
-            f"silently. Reasons: "
-            f"{ {p.page + 1: p.ocr_reason for p in pages if p.page + 1 in set(dropped)} }"
-        )
 
     def _dispatch(page_num: int) -> str:
         page_bytes = _single_page_pdf(data, page_num)

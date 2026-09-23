@@ -193,6 +193,14 @@ def _page_number_of(page_pdf_bytes: bytes) -> int:
     return width - _PAGE_WIDTH_BASE
 
 
+def _page_health():
+    """The module to patch `scan_pdf_health` on. Imported lazily, since it
+    needs the `ocr` extra's PDF libraries."""
+    import anydoc.page_health
+
+    return anydoc.page_health
+
+
 def _max_overlap(spans: list[tuple[float, float]]) -> int:
     """Max number of (start, end) intervals active at the same instant."""
     events = sorted((t, delta) for start, end in spans for t, delta in ((start, 1), (end, -1)))
@@ -522,44 +530,6 @@ class AzureOcrTest(unittest.TestCase):
             self.assertNotIsInstance(caught.exception, HttpResponseError)
             self.assertIn("InvalidContentLength", str(caught.exception))
 
-    def _fake_pages(self, *specs):
-        """Stands in for `extract_pages_markdown_bytes(...).pages`. Each spec
-        is (markdown, ocr_reason); pages are numbered 0-indexed in order, as
-        pdf-inspector numbers them."""
-        pages = [
-            SimpleNamespace(page=index, markdown=markdown, needs_ocr=not markdown.strip(), ocr_reason=reason)
-            for index, (markdown, reason) in enumerate(specs)
-        ]
-        return SimpleNamespace(pages=pages)
-
-    def test_an_unflagged_wiped_page_fails_the_call_instead_of_merging_empty(self):
-        """`extract_pages_markdown_bytes` blanks a page whose text it
-        distrusts. Until page health routes those pages to OCR they are not
-        in `error.pages`, so merging would silently drop real content -- the
-        one outcome this path must never produce. It must fail loudly, and
-        it must fail before paying Azure for the other pages."""
-        import pdf_inspector
-
-        pages = self._fake_pages(("", None), ("native text\n", None), ("", "vector_text"))
-
-        with azure_env(), azure_stub(lambda page_bytes: self.fail("should not reach Azure")):
-            with patch.object(pdf_inspector, "extract_pages_markdown_bytes", return_value=pages):
-                with self.assertRaisesRegex(anydoc.OcrError, r"pages \[3\].*vector_text"):
-                    anydoc._parse_ocr(_blank_pdf(3), [1])
-
-    def test_a_genuinely_blank_page_is_not_mistaken_for_a_wiped_one(self):
-        """A blank page reports `needs_ocr` too, but states no reason. The
-        guard above must not reject a document for containing one."""
-        import pdf_inspector
-
-        pages = self._fake_pages(("", None), ("native text\n", None), ("", None))
-
-        with azure_env(), azure_stub(lambda page_bytes: "OCR OF PAGE ONE\n"):
-            with patch.object(pdf_inspector, "extract_pages_markdown_bytes", return_value=pages):
-                result = anydoc._parse_ocr(_blank_pdf(3), [1])
-        self.assertIn("OCR OF PAGE ONE", result)
-        self.assertIn("native text", result)
-
     def test_engine_selection_is_by_environment_and_names_no_engine_when_unset(self):
         """`requested()` is the only thing that knows more than one engine
         exists. With nothing configured it must return None so `to_markdown`
@@ -619,13 +589,12 @@ class RoutingTest(unittest.TestCase):
         simulated here, and the real document was verified by hand -- 53
         pages routed, page 25 recovered. A fixture that reproduces it would
         be worth having."""
-        import anydoc.page_health as page_health
 
         data = FIXTURES / "pdf" / "text.pdf"
         health = [SimpleNamespace(page=1, needs_ocr=True)]
         with azure_env():
             with patch("anydoc._to_markdown_bytes", return_value="native\n"):
-                with patch.object(page_health, "scan_pdf_health", return_value=health):
+                with patch.object(_page_health(), "scan_pdf_health", return_value=health):
                     with azure_stub(lambda page_bytes: "OCR TEXT\n") as spans:
                         result = anydoc.to_markdown_bytes(data.read_bytes())
         self.assertEqual(len(spans), 1, "a clean conversion was not routed")
@@ -634,11 +603,10 @@ class RoutingTest(unittest.TestCase):
     def test_nothing_is_scanned_when_no_engine_is_configured(self):
         """The zero-cost promise: a caller who never asked for OCR pays for no
         scan and gets byte-identical output."""
-        import anydoc.page_health as page_health
 
         data = (FIXTURES / "pdf" / "text.pdf").read_bytes()
         with azure_env(endpoint=None, key=None):
-            with patch.object(page_health, "scan_pdf_health") as scan:
+            with patch.object(_page_health(), "scan_pdf_health") as scan:
                 before = anydoc.to_markdown_bytes(data)
                 scan.assert_not_called()
             after = anydoc.to_markdown_bytes(data)
@@ -647,25 +615,37 @@ class RoutingTest(unittest.TestCase):
     def test_a_non_pdf_is_never_scanned(self):
         """`NeedsOcr` is raised in one place in the Rust core, and page health
         reads PDF content streams. Neither applies to a docx."""
-        import anydoc.page_health as page_health
 
         with azure_env():
-            with patch.object(page_health, "scan_pdf_health") as scan:
+            with patch.object(_page_health(), "scan_pdf_health") as scan:
                 anydoc.to_markdown_bytes(RICH.read_bytes())
                 scan.assert_not_called()
 
-    def test_a_failing_scan_does_not_break_a_working_conversion(self):
-        """Fails open, deliberately. A scan is an opinion about a document
-        that already converted; a bug in forming that opinion must not take
-        the conversion down with it."""
-        import anydoc.page_health as page_health
+    def test_a_failing_scan_fails_the_conversion_loudly(self):
+        """A scan that cannot run means the document was never checked.
+        Returning it anyway would assert it is healthy on no evidence, and --
+        worse than any single document -- would let one bug switch page health
+        off while every tender still looked fine.
 
+        The cost is real but was measured: the scan reads content streams
+        through `pypdf`, stricter than the core's `lopdf`, so a document can
+        convert and then fail to scan. Across the 17 real PDFs in
+        SysAgentsHarness's corpus, zero did."""
         data = (FIXTURES / "pdf" / "text.pdf").read_bytes()
         with azure_env():
-            with patch.object(page_health, "scan_pdf_health", side_effect=RuntimeError("scan bug")):
+            with patch.object(_page_health(), "scan_pdf_health", side_effect=RuntimeError("scan bug")):
                 with azure_stub(lambda page_bytes: self.fail("should not reach Azure")):
-                    result = anydoc.to_markdown_bytes(data)
-        self.assertEqual(result, anydoc.to_markdown_bytes(data))
+                    with self.assertRaisesRegex(anydoc.OcrError, "could not assess.*scan bug"):
+                        anydoc.to_markdown_bytes(data)
+
+    def test_a_scan_failure_is_not_raised_at_all_without_an_engine(self):
+        """Failing loudly must not leak to callers who never asked for OCR:
+        with no engine configured the scan never runs, so a scan that would
+        have raised cannot affect them."""
+        data = (FIXTURES / "pdf" / "text.pdf").read_bytes()
+        with azure_env(endpoint=None, key=None):
+            with patch.object(_page_health(), "scan_pdf_health", side_effect=RuntimeError("scan bug")):
+                self.assertTrue(anydoc.to_markdown_bytes(data))
 
     def test_the_two_detectors_are_unioned_not_replaced(self):
         """The core catches a page with no text at all; page health catches a
@@ -673,21 +653,19 @@ class RoutingTest(unittest.TestCase):
         both must send both, or whichever detector ran second silently wins.
         `handmade-mixed` raises for its scanned page 2; health is made to
         flag page 1 as well."""
-        import anydoc.page_health as page_health
 
         health = [SimpleNamespace(page=1, needs_ocr=True), SimpleNamespace(page=2, needs_ocr=False)]
         with azure_env():
-            with patch.object(page_health, "scan_pdf_health", return_value=health):
+            with patch.object(_page_health(), "scan_pdf_health", return_value=health):
                 with azure_stub(lambda page_bytes: "OCR\n") as spans:
                     anydoc.to_markdown_bytes(MIXED.read_bytes())
         self.assertEqual(len(spans), 2, "expected the core's page 2 and health's page 1")
 
     def test_hosted_still_wins_and_skips_the_scan_entirely(self):
-        import anydoc.page_health as page_health
 
         reply = {"success": True, "data": {"markdown": HOSTED_MARKDOWN}}
         with azure_env(), hosted_stub(200, reply):
-            with patch.object(page_health, "scan_pdf_health") as scan:
+            with patch.object(_page_health(), "scan_pdf_health") as scan:
                 result = anydoc.to_markdown(MIXED, ocr="hosted")
                 scan.assert_not_called()
         self.assertEqual(result, HOSTED_MARKDOWN)
@@ -764,6 +742,24 @@ class PageHealthTest(unittest.TestCase):
             self.assertEqual(page.markdown_chars, 0)
             self.assertGreater(page.native_chars, 0, "a wipe means the text is still there")
             self.assertTrue(page.needs_ocr, "a wipe must route to OCR, not be rebuilt")
+
+    def test_a_genuinely_blank_page_is_not_flagged(self):
+        """A blank page and a wiped one both yield no Markdown. Only the wiped
+        one lost something, and only it should cost an OCR call.
+
+        `has_ink` is what separates them: a page that draws nothing has
+        nothing to recover. This used to be enforced further downstream, by a
+        guard in the merge step that skipped pages with no stated reason. That
+        guard is gone -- routing plus a loud scan failure made it unreachable
+        -- so the property is pinned here, where the decision is actually
+        made."""
+        from anydoc.page_health import scan_pdf_health
+
+        blank = scan_pdf_health(_blank_pdf(1))[0]
+        self.assertFalse(blank.has_ink)
+        self.assertEqual(blank.native_chars, 0)
+        self.assertEqual(blank.reasons, [])
+        self.assertFalse(blank.needs_ocr, "a blank page must not cost an OCR call")
 
     def test_image_placeholders_do_not_count_as_extracted_text(self):
         """The positions API reports images as `[Image: ...]` pseudo-text.
