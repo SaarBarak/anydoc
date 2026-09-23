@@ -58,5 +58,13 @@ strip = "symbols"
 # cargo rejects the patch outright ("candidate versions found which didn't
 # match"). The fork tracks upstream's version, so keep it >= the requirement
 # and track the RTL-fix revision with the tag, never the crate version.
+#
+# This tag is pinned in a second place: `python/pyproject.toml`'s `azure`
+# extra. That extra exists because `_parse_azure` imports `pdf-inspector` as
+# a Python package, which resolves independently of the crate this redirect
+# governs -- so the two halves of one install can sit on different versions.
+# They did: the crate carried the RTL fix and the Python package did not, and
+# Hebrew came back character-reversed from whichever path went through
+# Python. Move both pins together, always.
 [patch.crates-io]
 pdf-inspector = { git = "https://github.com/SaarBarak/pdf-inspector.git", tag = "v1.17.0-rtl-fix.2" }

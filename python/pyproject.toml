@@ -24,13 +24,27 @@ dynamic = ["version"]
 # Optional: `ocr="reject"` (the default) recovers pages via Azure Document
 # Intelligence instead of raising, when AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT
 # and _KEY are set. Kept optional so the base install stays dependency-free
-# for everyone not using it. Plain version constraint, no fork git URL --
-# same reasoning as Cargo.toml's `[patch.crates-io]` comment: avoids
-# upstream-merge conflicts; a consumer wanting the RTL-fixed pdf-inspector
-# fork build pins it themselves (e.g. `[tool.uv.sources]`), same as they
-# already do for this package itself.
+# for everyone not using it.
+#
+# `pdf-inspector` is pinned to the same fork tag `Cargo.toml`'s
+# `[patch.crates-io]` redirects the crate to, and for the same reason. This
+# package is consumed twice: the Rust core links the crate, and `_parse_azure`
+# imports the Python package. A plain version constraint here resolves the
+# second one from PyPI -- upstream, without the fork's RTL fix -- so the two
+# halves of one install disagreed, and Hebrew came back character-reversed
+# from whichever path went through Python. Keeping both on one tag is what
+# stops that. Move them together.
+#
+# The git URL must not reach upstream: PyPI rejects packages whose
+# dependencies carry direct references, so this line would break their
+# release. It is safe here only because this whole extra is fork-added --
+# upstream has no `[project.optional-dependencies]` at all.
 [project.optional-dependencies]
-azure = ["azure-ai-documentintelligence>=1.0.2", "pdf-inspector>=1.17.0", "pypdf>=5.0"]
+azure = [
+    "azure-ai-documentintelligence>=1.0.2",
+    "pdf-inspector @ git+https://github.com/SaarBarak/pdf-inspector.git@v1.17.0-rtl-fix.2",
+    "pypdf>=5.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/firecrawl/anydoc#readme"
