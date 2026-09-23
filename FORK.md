@@ -8,7 +8,8 @@ Two things now, and they have different costs to maintain.
    build (see `SaarBarak/pdf-inspector`'s own `FORK.md`) that fixes
    Hebrew/RTL text extraction. Cargo's `[patch.crates-io]` and the `ocr`
    extra's pin in `python/pyproject.toml` both name that fork's tag, and
-   both must move together — see "The pin is in two places" below.
+   redirects the crate once; the Python layer reads through anydoc's own
+   bindings rather than a second package — see "The pin is in one place".
 2. **Feature work.** Azure Document Intelligence OCR dispatch: when a PDF's
    scanned pages would otherwise raise `NeedsOcrError`, they are recovered
    page by page and merged back, and the rest of the document never leaves
@@ -61,22 +62,30 @@ unlike `pdf-inspector`'s (see that repo's `FORK.md`).
    `anydoc/ocr_clients/`, the `ocr="reject"` escalation in
    `anydoc/__init__.py`, and the `ocr`/`azure` extras. See "What this fork is for".
 
-## The pin is in two places
+## The pin is in one place, and should stay there
 
-`pdf-inspector` is consumed twice, and both consumers resolve independently:
+`pdf-inspector` is redirected once, by `Cargo.toml`'s `[patch.crates-io]`.
+The Python layer reads a PDF's per-page state through anydoc's own bindings
+(`pdf_pages_markdown`, `pdf_text_positions`), which run inside this binary and
+therefore against that same redirected crate.
 
-| Consumer | Declared in | Resolves from |
-|---|---|---|
-| Rust core, links the crate | `Cargo.toml` `[patch.crates-io]` | the fork tag |
-| the OCR dispatch, imports the package | `python/pyproject.toml`, `ocr` extra | the fork tag |
+**It was not always one place, and the failure is worth remembering.** The
+Python layer used to `import pdf_inspector` as a separately installed package.
+That resolved independently of the crate — from PyPI, upstream, without the
+RTL fix — so one install carried two versions of one library, and Hebrew came
+back character-reversed from whichever path went through Python, in the fork
+that exists to prevent exactly that. It was fixed first by pinning both to one
+tag and a rule to move them together; the second consumer was removed
+afterwards, which is what made the rule unnecessary.
 
-They were not always both redirected. The Python side carried a plain
-`pdf-inspector>=1.17.0`, which resolves from PyPI — upstream, without the
-RTL fix — so one install held two versions of one library and Hebrew came
-back character-reversed from whichever path went through Python, in the
-fork that exists to prevent exactly that.
+**Do not reintroduce a second consumer.** Needing more of `pdf-inspector`'s
+API from Python is a reason to add a binding in `python/src/lib.rs`, not to
+add the package back to an extra. A binding cannot drift from the crate; an
+extra always can.
 
-**Move both together, always.** A bump that touches one is the bug.
+It also keeps a `git+` direct reference out of `python/pyproject.toml`. PyPI
+rejects packages whose dependencies carry one, so that pin could never have
+gone upstream.
 
 ## Branch
 
@@ -106,11 +115,9 @@ patch sets. Neither applies today — don't create one preemptively.
 
 ## If `pdf-inspector` cuts a new patch tag
 
-Bump **both** pins on `develop` to the new tag — `[patch.crates-io]` in
-`Cargo.toml` *and* the `ocr` extra in `python/pyproject.toml`. Bumping
-only the first is the bug described in "The pin is in two places": the Rust
-core moves to the new fork build while the Python side keeps resolving
-upstream from PyPI, and Hebrew comes back reversed from the Azure path.
+Bump the `[patch.crates-io]` pin in `Cargo.toml` on `develop` to the new tag.
+That is the only pin — the Python layer has no second one to keep in step, by
+design; see "The pin is in one place".
 
 This repo's own test suite doesn't cover Hebrew — the real regression gate
 is `tests/test_document_parser.py` in `SysAgentsHarness`. Tag the result

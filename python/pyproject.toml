@@ -25,31 +25,23 @@ dynamic = ["version"]
 # OCR engine instead of raising. Kept optional so the base install stays
 # dependency-free for everyone not using it.
 #
-# `ocr` is what the dispatch itself needs, independent of engine: reading the
-# document's native pages to merge around the OCR'd ones, and slicing one page
-# out to send. Every engine needs both, so they do not belong to any one
-# engine's extra. An engine extra is that engine's SDK plus this.
+# `ocr` is what the dispatch itself needs, independent of engine: slicing one
+# page out of the document to send. Every engine needs it, so it does not
+# belong to any one engine's extra. An engine extra is that engine's SDK plus
+# this.
 #
-# `pdf-inspector` is pinned to the same fork tag `Cargo.toml`'s
-# `[patch.crates-io]` redirects the crate to, and for the same reason. This
-# package is consumed twice: the Rust core links the crate, and the OCR
-# dispatch imports the Python package. A plain version constraint here
-# resolves the second one from PyPI -- upstream, without the fork's RTL fix --
-# so the two halves of one install disagreed, and Hebrew came back
-# character-reversed from whichever path went through Python. Keeping both on
-# one tag is what stops that. Move them together.
+# `pdf-inspector` is deliberately absent. Reading a PDF's per-page state goes
+# through anydoc's own bindings (`pdf_pages_markdown`), against the crate the
+# root `[patch.crates-io]` already redirects to the fork. Installing it here as
+# a second Python package would resolve it independently of that crate, which
+# is exactly how one install ended up carrying two versions of one library --
+# the crate with the RTL fix, the Python package without it -- and Hebrew came
+# back character-reversed from whichever path went through Python.
 #
-# The git URL must not reach upstream: PyPI rejects packages whose
-# dependencies carry direct references, so this line would break their
-# release. It is safe here only because these extras are fork-added --
-# upstream has no `[project.optional-dependencies]` at all.
-#
-# `proto/anydoc-pdf-bindings` would remove this pin entirely by exposing the
-# two calls through anydoc's own bindings, against the crate already
-# redirected. One version, nothing to keep in sync, and no direct reference.
+# It also keeps a `git+` direct reference out of this file. PyPI rejects
+# packages whose dependencies carry one, so a pin here could never go upstream.
 [project.optional-dependencies]
 ocr = [
-    "pdf-inspector @ git+https://github.com/SaarBarak/pdf-inspector.git@v1.17.0-rtl-fix.2",
     "pypdf>=5.0",
 ]
 azure = [

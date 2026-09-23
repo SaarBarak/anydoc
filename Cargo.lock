@@ -118,6 +118,7 @@ name = "anydoc-python"
 version = "0.2.4"
 dependencies = [
  "anydoc",
+ "pdf-inspector",
  "pyo3",
 ]
 

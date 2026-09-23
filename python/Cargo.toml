@@ -14,6 +14,13 @@ crate-type = ["cdylib"]
 
 [dependencies]
 anydoc = { path = ".." }
+# The same crate anydoc's PDF backend already links, and the root
+# `[patch.crates-io]` redirects both to the RTL-fixed fork. Depending on it
+# here is what lets the Python layer read a PDF's per-page state through
+# these bindings instead of installing `pdf-inspector` as a second, separately
+# resolved Python package — which is how the two ended up on different
+# versions, with Hebrew coming back reversed from the Python side.
+pdf-inspector = "1.14.2"
 # abi3-py310 pins the stable ABI: one wheel per platform covers every
 # CPython from 3.10 up.
 pyo3 = { version = "0.29", features = ["abi3-py310", "extension-module"] }

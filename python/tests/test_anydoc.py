@@ -130,7 +130,7 @@ def azure_stub(analyze):
 
 def _blank_pdf(num_pages: int) -> bytes:
     """A real, valid multi-page PDF with no content -- enough for
-    `_single_page_pdf` to slice and `pdf_inspector` to read, without needing
+    `_single_page_pdf` to slice and the page reader to read, without needing
     a committed fixture file. Content is irrelevant to the orchestration/
     concurrency tests that use this; the Azure call itself is always mocked."""
     from pypdf import PdfWriter
@@ -246,10 +246,18 @@ class AnydocTest(unittest.TestCase):
 
     def test_the_stubs_cover_the_module(self):
         stub = Path(anydoc.__file__).with_name("_anydoc.pyi")
+        # TypedDicts describe the shape of a dict a binding returns, so they
+        # are stub-only by design and have no runtime counterpart to match.
+        # Everything else in the stub must correspond to a real export -- that
+        # is what catches a binding added without a stub.
         stubbed = {
             node.name
             for node in ast.parse(stub.read_text()).body
             if isinstance(node, (ast.FunctionDef, ast.ClassDef))
+            and not (
+                isinstance(node, ast.ClassDef)
+                and any(getattr(base, "id", None) == "TypedDict" for base in node.bases)
+            )
         }
         exported = {name for name in dir(anydoc._anydoc) if not name.startswith("_")}
         self.assertEqual(stubbed, exported)
@@ -376,14 +384,18 @@ class AzureOcrTest(unittest.TestCase):
             self.assertIn("InvalidContentLength", str(caught.exception))
 
     def _fake_pages(self, *specs):
-        """Stands in for `extract_pages_markdown_bytes(...).pages`. Each spec
-        is (markdown, ocr_reason); pages are numbered 0-indexed in order, as
-        pdf-inspector numbers them."""
-        pages = [
-            SimpleNamespace(page=index, markdown=markdown, needs_ocr=not markdown.strip(), ocr_reason=reason)
+        """Stands in for `anydoc._anydoc.pdf_pages_markdown`, which returns one
+        dict per page. Each spec is (markdown, ocr_reason); pages are numbered
+        0-indexed in order, as the extractor numbers them."""
+        return [
+            {
+                "page": index,
+                "markdown": markdown,
+                "needs_ocr": not markdown.strip(),
+                "ocr_reason": reason,
+            }
             for index, (markdown, reason) in enumerate(specs)
         ]
-        return SimpleNamespace(pages=pages)
 
     def test_an_unflagged_wiped_page_fails_the_call_instead_of_merging_empty(self):
         """`extract_pages_markdown_bytes` blanks a page whose text it
@@ -391,26 +403,22 @@ class AzureOcrTest(unittest.TestCase):
         in `error.pages`, so merging would silently drop real content -- the
         one outcome this path must never produce. It must fail loudly, and
         it must fail before paying Azure for the other pages."""
-        import pdf_inspector
-
         fake_error = SimpleNamespace(pages=[1], page_count=3)
         pages = self._fake_pages(("", None), ("native text\n", None), ("", "vector_text"))
 
         with azure_env(), azure_stub(lambda page_bytes: self.fail("should not reach Azure")):
-            with patch.object(pdf_inspector, "extract_pages_markdown_bytes", return_value=pages):
+            with patch("anydoc.pdf_pages_markdown", return_value=pages):
                 with self.assertRaisesRegex(anydoc.OcrError, r"pages \[3\].*vector_text"):
                     anydoc._parse_ocr(_blank_pdf(3), fake_error)
 
     def test_a_genuinely_blank_page_is_not_mistaken_for_a_wiped_one(self):
         """A blank page reports `needs_ocr` too, but states no reason. The
         guard above must not reject a document for containing one."""
-        import pdf_inspector
-
         fake_error = SimpleNamespace(pages=[1], page_count=3)
         pages = self._fake_pages(("", None), ("native text\n", None), ("", None))
 
         with azure_env(), azure_stub(lambda page_bytes: "OCR OF PAGE ONE\n"):
-            with patch.object(pdf_inspector, "extract_pages_markdown_bytes", return_value=pages):
+            with patch("anydoc.pdf_pages_markdown", return_value=pages):
                 result = anydoc._parse_ocr(_blank_pdf(3), fake_error)
         self.assertIn("OCR OF PAGE ONE", result)
         self.assertIn("native text", result)

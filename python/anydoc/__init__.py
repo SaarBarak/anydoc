@@ -35,6 +35,8 @@ from anydoc._anydoc import (
     format_from_bytes,
     format_from_extension,
     format_from_path,
+    pdf_pages_markdown,
+    pdf_text_positions,
     to_document,
 )
 from anydoc._anydoc import to_markdown as _to_markdown
@@ -188,16 +190,23 @@ def _parse_ocr(data: bytes, error: NeedsOcrError, engine=None) -> str:
         raise OcrError(str(exc)) from exc
 
     try:
-        import pdf_inspector
+        from pypdf import PdfReader  # noqa: F401  -- probed, used in _dispatch
     except ImportError as exc:
         raise OcrError(
-            "OCR needs the page reader from the 'ocr' extra: "
+            "OCR needs the page slicer from the 'ocr' extra: "
             "pip install firecrawl-anydoc[ocr]"
         ) from exc
 
     # Unrestricted read of every page's native text, in document order --
     # the pages needing OCR (error.pages) come only from anydoc's own
     # restricted check, never re-derived from this array.
+    #
+    # Read through anydoc's own bindings, not a separately installed
+    # `pdf-inspector` Python package. Both would call the same library, but
+    # they would resolve it independently: the crate this binary links is
+    # redirected to the RTL-fixed fork, a PyPI install is not, and one install
+    # carried both versions until the pins were brought into line. There is no
+    # second resolution to keep in line now.
     #
     # A page this returns empty is a page whose text `pdf-inspector` distrusted
     # and discarded wholesale (upstream firecrawl/pdf-inspector#252, #342). It
@@ -207,8 +216,8 @@ def _parse_ocr(data: bytes, error: NeedsOcrError, engine=None) -> str:
     # the decision to recover such a page belongs to detection, which owns
     # what lands in `error.pages`, not to this merge step. Route the page to
     # OCR instead of reconstructing it.
-    pages = pdf_inspector.extract_pages_markdown_bytes(data).pages
-    merged = [page.markdown for page in pages]
+    pages = pdf_pages_markdown(data)
+    merged = [page["markdown"] for page in pages]
 
     # Refuse to return a document already known to be incomplete, and refuse
     # before spending anything on OCR for the pages that would have succeeded.
@@ -226,17 +235,18 @@ def _parse_ocr(data: bytes, error: NeedsOcrError, engine=None) -> str:
     # below the curve floor, say -- still passes here; separating that from
     # a blank page needs ink detection, which belongs with the other signals.
     flagged = set(error.pages)
-    dropped = [
-        page.page + 1
+    dropped = {
+        page["page"] + 1: page["ocr_reason"]
         for page in pages
-        if page.page + 1 not in flagged and not page.markdown.strip() and page.ocr_reason
-    ]
+        if page["page"] + 1 not in flagged
+        and not page["markdown"].strip()
+        and page["ocr_reason"]
+    }
     if dropped:
         raise OcrError(
-            f"pages {dropped} lost their text to pdf-inspector's own suppression "
-            f"and were not flagged for OCR; returning the document would drop them "
-            f"silently. Reasons: "
-            f"{ {p.page + 1: p.ocr_reason for p in pages if p.page + 1 in set(dropped)} }"
+            f"pages {sorted(dropped)} lost their text to the extractor's own "
+            f"suppression and were not flagged for OCR; returning the document "
+            f"would drop them silently. Reasons: {dropped}"
         )
 
     def _dispatch(page_num: int) -> str:
@@ -362,6 +372,8 @@ __all__ = [
     "MissingPartError",
     "NeedsOcrError",
     "Note",
+    "pdf_pages_markdown",
+    "pdf_text_positions",
     "Ocr",
     "ResourceLimitError",
     "Style",

@@ -1,7 +1,7 @@
 # Hand-written stubs for the compiled module. `tests/test_anydoc.py` checks
 # they stay in step with what the module actually exports.
 import os
-from typing import Literal, final
+from typing import Literal, TypedDict, final
 
 Format = Literal[
     "doc", "docx", "odt", "pdf", "ppt", "pptx", "rtf", "epub", "xlsx", "ods", "odp", "csv"
@@ -78,6 +78,46 @@ def to_document(data: bytes | bytearray, format: Format | None = None) -> Docume
 
     Unsupported for `pdf`: PDF conversion produces Markdown directly and has
     no document-model form; use `to_markdown_bytes`."""
+
+def pdf_pages_markdown(data: bytes | bytearray) -> list[PageMarkdown]:
+    """Per-page extraction state for a PDF, in document order.
+
+    The same read anydoc's PDF backend performs, exposed so the Python layer
+    can see which pages the extractor distrusts without installing
+    `pdf-inspector` as a second package that would resolve independently of
+    the crate this binary links."""
+
+def pdf_text_positions(data: bytes | bytearray) -> list[TextItem]:
+    """Every positioned text item in a PDF.
+
+    Reports what the page draws, with no judgement about whether to trust it,
+    so it still returns items for pages `pdf_pages_markdown` suppresses."""
+
+class PageMarkdown(TypedDict):
+    page: int
+    """0-indexed page number."""
+    markdown: str
+    """Empty when the extractor distrusted this page and discarded its text."""
+    needs_ocr: bool
+    """True when the text on this page is unreliable. A genuinely blank page
+    also reports True."""
+    ocr_reason: str | None
+    """Machine-readable cause when it is known, `None` when it is not -- which
+    is what separates a page that lost text from one that never had any."""
+
+class TextItem(TypedDict):
+    text: str
+    page: int
+    """1-indexed, unlike `PageMarkdown.page`."""
+    x: float
+    y: float
+    """PDF coordinates: y increases up the page."""
+    width: float
+    height: float
+    is_image: bool
+    """True for a placeholder standing in for an embedded image rather than
+    real text. Counting those as characters makes an empty page look
+    populated."""
 
 @final
 class Document:

@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use pyo3::create_exception;
 use pyo3::exceptions::{PyException, PyValueError};
 use pyo3::prelude::*;
+use pyo3::types::{PyDict, PyList};
 
 mod document;
 
@@ -195,6 +196,74 @@ fn to_document(
     document::document(py, parsed)
 }
 
+/// Per-page extraction state for a PDF: one dict per page carrying `page`
+/// (0-indexed), `markdown`, `needs_ocr`, and `ocr_reason`.
+///
+/// This is the same read anydoc's own PDF backend performs, exposed so a
+/// caller can see which pages the extractor distrusts without installing
+/// `pdf-inspector` as a second Python package. That second package resolves
+/// independently of the crate this binary links, which is how the two ended
+/// up on different versions — the crate carrying the RTL fix, the Python
+/// package not — and Hebrew came back character-reversed from the Python
+/// side. Reading it here means there is one version, and no way for them to
+/// disagree.
+///
+/// A page whose `needs_ocr` is true returns an empty `markdown`: the
+/// extractor suppresses text it does not trust. `pdf_text_positions` still
+/// reports that page's items, which is what makes the suppression
+/// recoverable.
+#[pyfunction]
+fn pdf_pages_markdown<'py>(py: Python<'py>, data: Vec<u8>) -> PyResult<Bound<'py, PyList>> {
+    let extraction = py
+        .detach(|| pdf_inspector::extract_pages_markdown_mem(&data, None))
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let pages = PyList::empty(py);
+    for page in extraction.pages {
+        let entry = PyDict::new(py);
+        entry.set_item("page", page.page)?;
+        entry.set_item("markdown", page.markdown)?;
+        entry.set_item("needs_ocr", page.needs_ocr)?;
+        // `None` when the extractor distrusted the page without being able to
+        // say why. The dispatch's dropped-page guard keys on this: a page that
+        // is empty *and* states a reason lost text, where a genuinely blank
+        // page reports `needs_ocr` with no reason at all.
+        entry.set_item("ocr_reason", page.ocr_reason)?;
+        pages.append(entry)?;
+    }
+    Ok(pages)
+}
+
+/// Every positioned text item in a PDF: one dict per item carrying `text`,
+/// `page` (1-indexed), `x`, `y`, `width`, `height`, and `is_image`.
+///
+/// Reports what the page draws, with no judgement about whether to trust it,
+/// so it still returns items for pages `pdf_pages_markdown` suppresses.
+/// `is_image` marks placeholders standing in for embedded images rather than
+/// real text — counting those as characters makes an empty page look
+/// populated.
+#[pyfunction]
+fn pdf_text_positions<'py>(py: Python<'py>, data: Vec<u8>) -> PyResult<Bound<'py, PyList>> {
+    let items = py
+        .detach(|| pdf_inspector::extractor::extract_text_with_positions_mem(&data))
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let out = PyList::empty(py);
+    for item in items {
+        let entry = PyDict::new(py);
+        entry.set_item("text", item.text)?;
+        entry.set_item("page", item.page)?;
+        entry.set_item("x", item.x)?;
+        entry.set_item("y", item.y)?;
+        entry.set_item("width", item.width)?;
+        entry.set_item("height", item.height)?;
+        entry.set_item(
+            "is_image",
+            matches!(item.item_type, pdf_inspector::types::ItemType::Image),
+        )?;
+        out.append(entry)?;
+    }
+    Ok(out)
+}
+
 /// Convert documents to GitHub-Flavored Markdown.
 #[pymodule]
 fn _anydoc(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -204,6 +273,8 @@ fn _anydoc(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(to_markdown, m)?)?;
     m.add_function(wrap_pyfunction!(to_markdown_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(to_document, m)?)?;
+    m.add_function(wrap_pyfunction!(pdf_pages_markdown, m)?)?;
+    m.add_function(wrap_pyfunction!(pdf_text_positions, m)?)?;
     m.add_class::<document::Asset>()?;
     m.add_class::<document::Block>()?;
     m.add_class::<document::Cell>()?;
