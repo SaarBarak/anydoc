@@ -163,6 +163,20 @@ def _blank_pdf(num_pages: int) -> bytes:
     return out.getvalue()
 
 
+def _numbered_pdf(num_pages: int) -> bytes:
+    """A real multi-page PDF whose pages are telling apart by size: page N is
+    (200 + N) points wide. That is what lets a stub know which page it was
+    handed, without depending on any text extraction."""
+    from pypdf import PdfWriter
+
+    writer = PdfWriter()
+    for number in range(1, num_pages + 1):
+        writer.add_blank_page(width=200 + number, height=200)
+    out = io.BytesIO()
+    writer.write(out)
+    return out.getvalue()
+
+
 def _max_overlap(spans: list[tuple[float, float]]) -> int:
     """Max number of (start, end) intervals active at the same instant."""
     events = sorted((t, delta) for start, end in spans for t, delta in ((start, 1), (end, -1)))
@@ -408,6 +422,35 @@ class AzureOcrTest(unittest.TestCase):
         # two batches, ~0.4s. Generous bound against CI jitter.
         self.assertLess(elapsed, 1.0, f"took {elapsed:.2f}s -- looks serial, not parallel")
         self.assertGreater(_max_overlap(spans), 1, "no real overlap between calls")
+
+    def test_results_land_by_page_number_even_when_they_finish_backwards(self):
+        """Pages are OCR'd one per call but eight at a time, so they finish in
+        whatever order the service returns them. That must not be able to
+        reorder the document.
+
+        Two things make it safe, and this pins both: `pool.map` yields results
+        in submission order regardless of completion order, and the merge
+        writes each result to `merged[page_num - 1]` rather than appending.
+        Here the stub finishes page 5 first and page 1 last -- the exact
+        inversion -- and the document must still read 1, 2, 3, 4, 5."""
+        from pypdf import PdfReader
+
+        data = _numbered_pdf(5)
+        finished = []
+
+        def slow_for_early_pages(page_bytes):
+            width = int(PdfReader(io.BytesIO(page_bytes)).pages[0].mediabox.width)
+            page_num = width - 200
+            time.sleep(0.05 * (6 - page_num))  # page 1 sleeps longest
+            finished.append(page_num)
+            return f"OCR-{page_num}\n"
+
+        with azure_env(), azure_stub(slow_for_early_pages):
+            result = anydoc._parse_ocr(data, [1, 2, 3, 4, 5])
+
+        self.assertEqual(finished, [5, 4, 3, 2, 1], "the stub did not finish backwards")
+        positions = [result.index(f"OCR-{n}") for n in range(1, 6)]
+        self.assertEqual(positions, sorted(positions), f"pages came out scrambled: {result!r}")
 
     def test_one_page_failing_fails_the_whole_call(self):
         data = _blank_pdf(3)
