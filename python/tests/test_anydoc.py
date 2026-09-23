@@ -4,6 +4,7 @@ import ast
 import io
 import json
 import os
+import re
 import threading
 import time
 import unittest
@@ -16,7 +17,8 @@ from unittest.mock import patch
 
 import anydoc
 
-FIXTURES = Path(__file__).resolve().parents[2] / "tests" / "fixtures"
+REPO = Path(__file__).resolve().parents[2]
+FIXTURES = REPO / "tests" / "fixtures"
 OUTLINE = FIXTURES / "docx" / "handmade-outline.docx"
 RICH = FIXTURES / "docx" / "handmade-rich.docx"
 CSV = FIXTURES / "csv" / "sheet.csv"
@@ -32,6 +34,13 @@ try:
     _AZURE_EXTRA_INSTALLED = True
 except ImportError:
     _AZURE_EXTRA_INSTALLED = False
+
+try:
+    import pdf_inspector  # noqa: F401
+
+    _PDF_INSPECTOR_INSTALLED = True
+except ImportError:
+    _PDF_INSPECTOR_INSTALLED = False
 
 
 @contextmanager
@@ -151,6 +160,63 @@ def _max_overlap(spans: list[tuple[float, float]]) -> int:
         current += delta
         peak = max(peak, current)
     return peak
+
+
+class ForkPinTest(unittest.TestCase):
+    """`pdf-inspector` is consumed twice and the two consumers resolve
+    independently: the Rust core links the crate, redirected by
+    `Cargo.toml`'s `[patch.crates-io]`, and the OCR dispatch imports the
+    Python package declared in `pyproject.toml`'s `ocr` extra.
+
+    When they disagreed, nothing raised. The crate carried the RTL fix, the
+    Python package came from PyPI without it, and Hebrew came back
+    character-reversed from whichever path went through Python -- in the fork
+    that exists to prevent exactly that. FORK.md answers it with a rule,
+    "move both together, always"; these tests are that rule enforced, so a
+    bump that touches one pin fails the build instead of a document."""
+
+    CRATE_PIN = re.compile(
+        r"""pdf-inspector\s*=\s*\{[^}]*?tag\s*=\s*["']([^"']+)["']""", re.S
+    )
+    EXTRA_PIN = re.compile(r"""pdf-inspector\s*@\s*git\+(\S+?)@([^"'\s]+)""")
+
+    def test_the_crate_and_the_python_package_name_the_same_fork_tag(self):
+        """Static, so it runs everywhere and needs nothing installed. This is
+        the one that catches a half-finished bump at review time."""
+        crate = self.CRATE_PIN.search((REPO / "Cargo.toml").read_text())
+        self.assertIsNotNone(crate, "no [patch.crates-io] tag found in Cargo.toml")
+        extra = self.EXTRA_PIN.search((REPO / "python" / "pyproject.toml").read_text())
+        self.assertIsNotNone(extra, "no pdf-inspector pin found in the ocr extra")
+        url, extra_tag = extra.groups()
+        self.assertEqual(
+            extra_tag,
+            crate.group(1),
+            "the ocr extra and [patch.crates-io] name different fork tags; one was "
+            "bumped without the other, which is how Hebrew came back reversed",
+        )
+        self.assertIn("SaarBarak/pdf-inspector", url)
+
+    @unittest.skipUnless(_PDF_INSPECTOR_INSTALLED, "pdf-inspector not installed")
+    def test_the_installed_package_came_from_that_fork_tag(self):
+        """The environment, not the declaration. A venv can be stale: a
+        Hebrew check once "failed" against an install still holding PyPI
+        1.20.0, long after both pins were correct."""
+        from importlib.metadata import distribution
+
+        crate_tag = self.CRATE_PIN.search((REPO / "Cargo.toml").read_text()).group(1)
+        raw = distribution("pdf-inspector").read_text("direct_url.json")
+        self.assertIsNotNone(
+            raw,
+            "pdf-inspector has no direct_url.json, so it came from PyPI -- that is "
+            "upstream, without the RTL fix. Reinstall the ocr extra.",
+        )
+        info = json.loads(raw)
+        self.assertIn("SaarBarak/pdf-inspector", info["url"])
+        self.assertEqual(
+            info.get("vcs_info", {}).get("requested_revision"),
+            crate_tag,
+            "the installed pdf-inspector is a different fork tag from the crate",
+        )
 
 
 class AnydocTest(unittest.TestCase):

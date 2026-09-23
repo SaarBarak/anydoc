@@ -78,6 +78,43 @@ fork that exists to prevent exactly that.
 
 **Move both together, always.** A bump that touches one is the bug.
 
+**`ForkPinTest` in `python/tests/test_anydoc.py` enforces that**, so this is a
+rule the build checks rather than one a reader has to remember. Two tests:
+
+- the tag in `[patch.crates-io]` and the tag in the `ocr` extra must match.
+  Static, needs nothing installed, and fails at review time on a half-finished
+  bump.
+- the *installed* `pdf-inspector` must come from the fork URL and from that
+  same tag, read out of its `direct_url.json`. A package resolved from PyPI has
+  no such file, which is exactly the original failure; a stale venv on an older
+  fork tag is the other one this catches.
+
+Removing the second consumer entirely was prototyped and rejected — see
+"Rejected: reading through our own bindings" below.
+
+## Rejected: reading through our own bindings
+
+`proto/anydoc-pdf-bindings` (closed PR #3) removes the second consumer instead
+of keeping it in step: two PyO3 functions expose the reads the Python layer
+needs, against the crate `[patch.crates-io]` already redirects. One resolution,
+nothing to keep aligned, and no `git+` direct reference in `pyproject.toml`
+(PyPI rejects those in dependencies).
+
+It works — it compiles, and its output is byte-identical to the Python package
+on a Hebrew fixture. **It is rejected on maintenance cost, not correctness.**
+`python/src/lib.rs` is upstream's PyO3 bridge, a file upstream touches whenever
+it adds or changes any API, which makes it the most expensive place in the tree
+to carry a fork patch — and in a language the rest of this fork's work
+deliberately avoids. It also adds `pdf-inspector` to `python/Cargo.toml`,
+another upstream-owned file, changing the build for anyone installing the fork.
+
+The constraint it breaks is recorded: *"Python layer only, no Rust changes, no
+changes to `pdf-inspector`"* — `SysAgentsHarness`'s OCR architecture decisions
+doc, the page-health routing PRD, and this repo's PR #1 as D1.
+
+The branch is kept, not deleted. It is the right answer if that constraint is
+ever lifted, or if tracking upstream stops mattering.
+
 ## Branch
 
 **`develop`** is the one long-lived branch — it accumulates every
@@ -111,6 +148,10 @@ Bump **both** pins on `develop` to the new tag — `[patch.crates-io]` in
 only the first is the bug described in "The pin is in two places": the Rust
 core moves to the new fork build while the Python side keeps resolving
 upstream from PyPI, and Hebrew comes back reversed from the Azure path.
+
+`ForkPinTest` fails if you bump one and not the other, and again if your venv
+is still on the old tag after both are bumped. Reinstall the extra before
+believing a Hebrew result.
 
 This repo's own test suite doesn't cover Hebrew — the real regression gate
 is `tests/test_document_parser.py` in `SysAgentsHarness`. Tag the result
