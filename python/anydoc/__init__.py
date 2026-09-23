@@ -93,15 +93,24 @@ def to_markdown(
     keyless; `api_url` to `FIRECRAWL_API_URL`, then
     `https://api.firecrawl.dev`."""
     try:
-        return _to_markdown(path)
+        markdown = _to_markdown(path)
     except NeedsOcrError as error:
         if ocr == "hosted":
             path = Path(path)
             return _parse_hosted(path.read_bytes(), path.name, api_key, api_url)
         engine = _ocr_requested()
+        if engine is None:
+            raise
+        data = Path(path).read_bytes()
+        return _parse_ocr(data, _route(data, error.pages), engine)
+    if ocr != "hosted":
+        engine = _ocr_requested()
         if engine is not None:
-            return _parse_ocr(Path(path).read_bytes(), error, engine)
-        raise
+            data = Path(path).read_bytes()
+            flagged = _health_pages(data)
+            if flagged:
+                return _parse_ocr(data, flagged, engine)
+    return markdown
 
 
 def to_markdown_bytes(
@@ -117,14 +126,28 @@ def to_markdown_bytes(
     name explicitly. `ocr`, `api_key` and `api_url` are as for
     `to_markdown`."""
     try:
-        return _to_markdown_bytes(data, format)
+        markdown = _to_markdown_bytes(data, format)
     except NeedsOcrError as error:
         if ocr == "hosted":
             return _parse_hosted(bytes(data), "document.pdf", api_key, api_url)
         engine = _ocr_requested()
+        if engine is None:
+            raise
+        return _parse_ocr(bytes(data), _route(bytes(data), error.pages), engine)
+    # A document that converted without raising can still have lost text: the
+    # core's check only fires when a page yields nothing at all, and a page
+    # whose glyphs were converted to outlines renders perfectly and extracts
+    # as nothing without ever being counted. That is the case page health
+    # exists for, and it is reachable only from here -- the real 95-page
+    # tender this was built against reports `pages_needing_ocr: []` and
+    # succeeds, 14 pages short.
+    if ocr != "hosted":
+        engine = _ocr_requested()
         if engine is not None:
-            return _parse_ocr(bytes(data), error, engine)
-        raise
+            flagged = _health_pages(bytes(data))
+            if flagged:
+                return _parse_ocr(bytes(data), flagged, engine)
+    return markdown
 
 
 _API_URL = "https://api.firecrawl.dev"
@@ -165,6 +188,50 @@ def _parse_hosted(data: bytes, filename: str, api_key: "str | None", api_url: "s
     return markdown if markdown.endswith("\n") else markdown + "\n"
 
 
+def _health_pages(data: bytes) -> "list[int]":
+    """Pages `page_health` says need OCR, 1-indexed.
+
+    Runs only when an engine is configured, so a caller who never asked for
+    OCR pays nothing and gets byte-identical output.
+
+    **Fails loudly**, and that is the deliberate half. A scan that cannot run
+    means the document was never checked; returning it anyway asserts it is
+    healthy on no evidence, which is the silent success this whole path exists
+    to remove. The systematic case is worse than the single document: failing
+    open would let one bug switch page health off entirely while every tender
+    still came back looking fine, and nothing anywhere would say so.
+
+    The cost was measured before choosing it. The scan reads content streams
+    through `pypdf`, which is stricter than the `lopdf` the Rust core uses, so
+    a document can in principle convert and then fail to scan -- a damaged
+    `startxref` does exactly that. Across the 17 real PDFs in
+    `SysAgentsHarness`'s corpus, including 250- and 360-page tenders, **zero**
+    did. The one file that fails there fails in `to_markdown` first and never
+    reaches this."""
+    if format_from_bytes(data) != "pdf":
+        # `page_health` reads a PDF's content streams. Nothing else can be
+        # scanned, and nothing else needs to be: `NeedsOcr` is raised in one
+        # place in the Rust core, src/formats/pdf.rs.
+        return []
+    try:
+        from anydoc.page_health import scan_pdf_health
+
+        return [page.page for page in scan_pdf_health(data) if page.needs_ocr]
+    except Exception as exc:
+        raise OcrError(
+            f"page health could not assess this document, so whether it lost text "
+            f"is unknown: {type(exc).__name__}: {exc}"
+        ) from exc
+
+
+def _route(data: bytes, already_flagged: "list[int]") -> "list[int]":
+    """Every page that should go to OCR: what the Rust core named, plus what
+    page health flags. The union, because the two see different failures --
+    the core catches a page with no text at all, page health catches a page
+    that renders perfectly and extracts as nothing."""
+    return sorted(set(already_flagged) | set(_health_pages(data)))
+
+
 _MAX_WORKERS = 8
 
 
@@ -180,7 +247,7 @@ _MAX_WORKERS = 8
 # merging, and the only engine-shaped operations are constructing the client
 # and calling `ocr_page`, both behind `ocr_clients.base.OcrClient`. Adding an
 # engine means writing a client module, never touching this function.
-def _parse_ocr(data: bytes, error: NeedsOcrError, engine=None) -> str:
+def _parse_ocr(data: bytes, pages_needing_ocr: "list[int]", engine=None) -> str:
     engine = engine if engine is not None else _ocr_requested()
     try:
         client = engine.client()
@@ -196,8 +263,8 @@ def _parse_ocr(data: bytes, error: NeedsOcrError, engine=None) -> str:
         ) from exc
 
     # Unrestricted read of every page's native text, in document order --
-    # the pages needing OCR (error.pages) come only from anydoc's own
-    # restricted check, never re-derived from this array.
+    # the pages needing OCR are decided by the caller and never re-derived
+    # from this array. Routing is detection's job; this function merges.
     #
     # A page this returns empty is a page whose text `pdf-inspector` distrusted
     # and discarded wholesale (upstream firecrawl/pdf-inspector#252, #342). It
@@ -205,39 +272,10 @@ def _parse_ocr(data: bytes, error: NeedsOcrError, engine=None) -> str:
     # -text API was tried and removed: reading order approximated from
     # coordinates loses the structure that makes tender content legible, and
     # the decision to recover such a page belongs to detection, which owns
-    # what lands in `error.pages`, not to this merge step. Route the page to
+    # what lands in the page list, not to this merge step. Route the page to
     # OCR instead of reconstructing it.
     pages = pdf_inspector.extract_pages_markdown_bytes(data).pages
     merged = [page.markdown for page in pages]
-
-    # Refuse to return a document already known to be incomplete, and refuse
-    # before spending anything on OCR for the pages that would have succeeded.
-    #
-    # This is not detection deciding what to OCR -- it routes nothing and
-    # flags nothing. It is the merge step declining to present a partial
-    # document as a whole one, which is the trade `ocr="reject"` makes
-    # everywhere else: for compliance content a loud failure beats a quiet
-    # gap. Once page health feeds these pages into `error.pages` they are
-    # OCR'd like any other and this can never fire.
-    #
-    # Gated on a stated `ocr_reason`, not on emptiness: a genuinely blank
-    # page also reports `needs_ocr`, and failing on those would reject valid
-    # documents. A wiped page whose reason is unstated -- an outlined title
-    # below the curve floor, say -- still passes here; separating that from
-    # a blank page needs ink detection, which belongs with the other signals.
-    flagged = set(error.pages)
-    dropped = [
-        page.page + 1
-        for page in pages
-        if page.page + 1 not in flagged and not page.markdown.strip() and page.ocr_reason
-    ]
-    if dropped:
-        raise OcrError(
-            f"pages {dropped} lost their text to pdf-inspector's own suppression "
-            f"and were not flagged for OCR; returning the document would drop them "
-            f"silently. Reasons: "
-            f"{ {p.page + 1: p.ocr_reason for p in pages if p.page + 1 in set(dropped)} }"
-        )
 
     def _dispatch(page_num: int) -> str:
         page_bytes = _single_page_pdf(data, page_num)
@@ -246,12 +284,12 @@ def _parse_ocr(data: bytes, error: NeedsOcrError, engine=None) -> str:
 
     try:
         with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:
-            results = list(pool.map(_dispatch, error.pages))
+            results = list(pool.map(_dispatch, pages_needing_ocr))
     except Exception as exc:
         raise OcrError(f"{engine.__name__.rsplit('.', 1)[-1]}: {exc}") from exc
 
-    for page_num, markdown in zip(error.pages, results):
-        merged[page_num - 1] = markdown  # error.pages is 1-indexed, merged is 0-indexed
+    for page_num, markdown in zip(pages_needing_ocr, results):
+        merged[page_num - 1] = markdown  # the page list is 1-indexed, merged is 0-indexed
 
     joined = "\n\n".join(merged)
     return joined if joined.endswith("\n") else joined + "\n"

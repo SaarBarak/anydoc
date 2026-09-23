@@ -185,7 +185,7 @@ clean-venv pass proves the package imports and the static checks hold; it
 proves almost nothing about the OCR code. Run it again in a venv with
 `[azure]` installed to actually exercise that.
 
-Four things that have each cost real time:
+Five things that have each cost real time:
 
 - **Run the Python tests from the repo root, never from `python/`.** With
   `python/` as the working directory the source `anydoc/` package dir shadows
@@ -204,6 +204,17 @@ Four things that have each cost real time:
   you are actually using.
 - **`--locked` means `Cargo.lock` must already be current.** If a dependency
   moved, commit the lockfile in the same PR.
+- **Clear `__pycache__` when you flip a constant to check a test has teeth.**
+  Python decides a `.pyc` is fresh from the source's mtime and byte length, at
+  one-second resolution. Editing a one-character constant there and back —
+  `_MAX_WORKERS` from `8` to `1` and back to `8` — changes neither, so the
+  "restored" run silently executes the old value and two tests keep failing
+  against a file that already reads correctly. Same family as the stale venv
+  above: the artifact under test is not the source you are looking at.
+
+  ```bash
+  find . -name __pycache__ -type d -not -path "./.venv/*" -exec rm -rf {} +
+  ```
 
 Hebrew is still not covered by anything here. The real regression gate is
 `tests/test_document_parser.py` in `SysAgentsHarness`, with
