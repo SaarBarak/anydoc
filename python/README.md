@@ -52,6 +52,14 @@ anydoc converts locally and does not do OCR, so a PDF with scanned or image-only
 markdown = anydoc.to_markdown("scan.pdf", ocr="hosted")
 ```
 
+Configure an OCR engine instead to recover only the scanned pages, one call per page, merged back into the rest of the document — the rest of the document never leaves the machine. Takes effect automatically wherever `ocr="reject"` (the default) would otherwise raise `NeedsOcrError`; no code change needed.
+
+Engines are selected from the environment, not from an argument, so nothing changes for a caller who configures none. Azure Document Intelligence is the one shipped today — set `AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT` and `AZURE_DOCUMENT_INTELLIGENCE_KEY`, and install the extra:
+
+```bash
+pip install firecrawl-anydoc[azure]
+```
+
 ## Errors
 
 A conversion raises only when no complete Markdown could come out of the file. The exception type names what went wrong:
@@ -74,6 +82,7 @@ except (anydoc.EncryptedError, anydoc.UnsupportedError) as error:
 | `ResourceLimitError` | Crossed a fixed safety limit (decompression, nesting, node count)   |
 | `MissingPartError`   | A part required for any meaningful output is absent                 |
 | `HostedError`        | `ocr="hosted"` could not get the document through Firecrawl Parse   |
+| `OcrError`           | An OCR engine is misconfigured, could not OCR the page, or the document has pages whose text was dropped and not recovered |
 | `OSError`            | The file could not be read, from `to_markdown` only                 |
 
 Every conversion failure subclasses `anydoc.ConvertError`, so catching that handles all of them at once. `MalformedError.part` and `MissingPartError.part` name the package part at fault, `ResourceLimitError.limit` names the limit crossed, and `str(error)` carries the whole message. A `format` argument naming no supported format raises `ValueError`.

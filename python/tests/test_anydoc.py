@@ -5,11 +5,14 @@ import io
 import json
 import os
 import threading
+import time
 import unittest
 import zipfile
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import anydoc
 
@@ -22,6 +25,13 @@ ZIPBOMB = FIXTURES / "abuse" / "zipbomb--errors.docx"
 MIXED = FIXTURES / "pdf" / "handmade-mixed.pdf"
 
 HOSTED_MARKDOWN = "# Read by the hosted parser\n"
+
+try:
+    import azure.ai.documentintelligence  # noqa: F401
+
+    _AZURE_EXTRA_INSTALLED = True
+except ImportError:
+    _AZURE_EXTRA_INSTALLED = False
 
 
 @contextmanager
@@ -59,6 +69,88 @@ def hosted_stub(status, body):
                 os.environ.pop(name, None)
             else:
                 os.environ[name] = value
+
+
+@contextmanager
+def azure_env(endpoint="https://example.cognitiveservices.azure.com/", key="fake-key"):
+    """Sets (or, if None, clears) the two Azure env vars, restoring whatever
+    was there after."""
+    names = ("AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT", "AZURE_DOCUMENT_INTELLIGENCE_KEY")
+    saved = {name: os.environ.pop(name, None) for name in names}
+    if endpoint is not None:
+        os.environ["AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT"] = endpoint
+    if key is not None:
+        os.environ["AZURE_DOCUMENT_INTELLIGENCE_KEY"] = key
+    try:
+        yield
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+@contextmanager
+def azure_stub(analyze):
+    """A stand-in for `DocumentIntelligenceClient`, patched at its origin
+    module so `_analyze_page`'s lazy import picks it up. `analyze(page_bytes)
+    -> str` runs once per Azure call with the single-page PDF bytes
+    `_analyze_page` actually built and sent (real `_single_page_pdf`
+    extraction is not mocked, so it's exercised for real); its return value
+    becomes that call's `result.content`, or if it raises, that call fails.
+    Yields the list of each call's (start, end) wall-clock span, for
+    checking real concurrency rather than just "it was fast"."""
+    import azure.ai.documentintelligence as adi
+
+    spans = []
+    lock = threading.Lock()
+
+    class _FakePoller:
+        def __init__(self, content):
+            self._content = content
+
+        def result(self):
+            return SimpleNamespace(content=self._content)
+
+    class _FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def begin_analyze_document(self, model, request, **kwargs):
+            start = time.monotonic()
+            content = analyze(request.bytes_source)
+            with lock:
+                spans.append((start, time.monotonic()))
+            return _FakePoller(content)
+
+    with patch.object(adi, "DocumentIntelligenceClient", _FakeClient):
+        yield spans
+
+
+def _blank_pdf(num_pages: int) -> bytes:
+    """A real, valid multi-page PDF with no content -- enough for
+    `_single_page_pdf` to slice and `pdf_inspector` to read, without needing
+    a committed fixture file. Content is irrelevant to the orchestration/
+    concurrency tests that use this; the Azure call itself is always mocked."""
+    from pypdf import PdfWriter
+
+    writer = PdfWriter()
+    for _ in range(num_pages):
+        writer.add_blank_page(width=200, height=200)
+    out = io.BytesIO()
+    writer.write(out)
+    return out.getvalue()
+
+
+def _max_overlap(spans: list[tuple[float, float]]) -> int:
+    """Max number of (start, end) intervals active at the same instant."""
+    events = sorted((t, delta) for start, end in spans for t, delta in ((start, 1), (end, -1)))
+    current = peak = 0
+    for _, delta in events:
+        current += delta
+        peak = max(peak, current)
+    return peak
 
 
 class AnydocTest(unittest.TestCase):
@@ -162,7 +254,203 @@ class AnydocTest(unittest.TestCase):
         exported = {name for name in dir(anydoc._anydoc) if not name.startswith("_")}
         self.assertEqual(stubbed, exported)
         # __init__.py re-exports the whole module, plus what it adds itself.
-        self.assertEqual(set(anydoc.__all__), exported | {"Format", "HostedError", "Ocr"})
+        self.assertEqual(set(anydoc.__all__), exported | {"Format", "HostedError", "OcrError", "Ocr"})
+
+
+@unittest.skipUnless(_AZURE_EXTRA_INSTALLED, "azure extra not installed")
+class AzureOcrTest(unittest.TestCase):
+    """Layer 2a/2b from the Azure OCR test plan: our own dispatch logic,
+    mocked at the `DocumentIntelligenceClient` boundary. Never calls the
+    real Azure service -- Layer 2c (real Azure behavior) is a separate,
+    deliberately deferred question, not covered here."""
+
+    def test_no_azure_config_raises_the_original_needs_ocr_error_unchanged(self):
+        with azure_env(endpoint=None, key=None):
+            with self.assertRaises(anydoc.NeedsOcrError) as caught:
+                anydoc.to_markdown(MIXED)
+            self.assertEqual(caught.exception.pages, [2])
+
+    def test_partial_config_raises_azure_error_immediately(self):
+        with azure_env(endpoint="https://example.cognitiveservices.azure.com/", key=None):
+            with self.assertRaisesRegex(anydoc.OcrError, "both.*set; only one is"):
+                anydoc.to_markdown_bytes(MIXED.read_bytes())
+        with azure_env(endpoint=None, key="fake-key"):
+            with self.assertRaisesRegex(anydoc.OcrError, "both.*set; only one is"):
+                anydoc.to_markdown_bytes(MIXED.read_bytes())
+
+    def test_ocr_hosted_wins_even_when_azure_is_configured(self):
+        reply = {"success": True, "data": {"markdown": HOSTED_MARKDOWN}}
+        with azure_env(), hosted_stub(200, reply) as hits, patch("anydoc._parse_ocr") as mock_azure:
+            result = anydoc.to_markdown(MIXED, ocr="hosted")
+            self.assertEqual(result, HOSTED_MARKDOWN)
+            mock_azure.assert_not_called()
+            self.assertEqual(hits, [("/v2/parse", True)])
+
+    def test_azure_replaces_only_the_flagged_page(self):
+        with azure_env(), azure_stub(lambda page_bytes: "AZURE OCR TEXT\n"):
+            result = anydoc.to_markdown_bytes(MIXED.read_bytes())
+        self.assertIn("Text on the first page", result)  # untouched native page
+        self.assertIn("AZURE OCR TEXT", result)  # the flagged page, replaced
+
+    def test_extra_not_installed_raises_a_clean_azure_error(self):
+        with azure_env(), patch.dict("sys.modules", {"azure.ai.documentintelligence": None}):
+            with self.assertRaisesRegex(anydoc.OcrError, r"pip install firecrawl-anydoc\[azure\]"):
+                anydoc.to_markdown_bytes(MIXED.read_bytes())
+
+    def test_page_number_outside_the_document_raises_azure_error_not_indexerror(self):
+        fake_error = SimpleNamespace(pages=[99], page_count=2)
+        with azure_env(), azure_stub(lambda page_bytes: "irrelevant"):
+            with self.assertRaises(anydoc.OcrError) as caught:
+                anydoc._parse_ocr(MIXED.read_bytes(), fake_error)
+            self.assertNotIsInstance(caught.exception, IndexError)
+
+    def test_empty_pages_list_returns_the_document_unchanged(self):
+        fake_error = SimpleNamespace(pages=[], page_count=2)
+
+        def fail_if_called(page_bytes):
+            self.fail("should not call Azure for an empty page list")
+
+        with azure_env(), azure_stub(fail_if_called):
+            result = anydoc._parse_ocr(MIXED.read_bytes(), fake_error)
+        self.assertIn("Text on the first page", result)
+
+    def test_pages_dispatch_in_parallel_and_none_are_dropped(self):
+        n = 10  # > max_workers (8), so this also covers the queueing case
+        data = _blank_pdf(n)
+        fake_error = SimpleNamespace(pages=list(range(1, n + 1)), page_count=n)
+
+        def slow_analyze(page_bytes):
+            time.sleep(0.2)
+            return "ok"
+
+        with azure_env():
+            t0 = time.monotonic()
+            with azure_stub(slow_analyze) as spans:
+                anydoc._parse_ocr(data, fake_error)
+            elapsed = time.monotonic() - t0
+
+        self.assertEqual(len(spans), n)  # every page dispatched exactly once
+        # Serial would take n * 0.2s = 2.0s; 8-way parallel should finish in
+        # two batches, ~0.4s. Generous bound against CI jitter.
+        self.assertLess(elapsed, 1.0, f"took {elapsed:.2f}s -- looks serial, not parallel")
+        self.assertGreater(_max_overlap(spans), 1, "no real overlap between calls")
+
+    def test_one_page_failing_fails_the_whole_call(self):
+        data = _blank_pdf(3)
+        fake_error = SimpleNamespace(pages=[1, 2, 3], page_count=3)
+        calls = {"n": 0}
+        lock = threading.Lock()
+
+        def flaky_analyze(page_bytes):
+            with lock:
+                calls["n"] += 1
+                this_call = calls["n"]
+            if this_call == 2:
+                raise RuntimeError("simulated Azure failure")
+            return "ok"
+
+        with azure_env(), azure_stub(flaky_analyze):
+            with self.assertRaisesRegex(anydoc.OcrError, "simulated Azure failure"):
+                anydoc._parse_ocr(data, fake_error)
+
+    def test_a_still_oversized_single_page_raises_a_clean_azure_error(self):
+        """_single_page_pdf fixes the whole-document size limit (confirmed
+        live against a real 5.1MB document -- see _single_page_pdf's
+        docstring), but a single page can in principle still be too large
+        on its own after extraction. A real oversized fixture is
+        disproportionate for a unit test, so this simulates Azure's actual
+        observed rejection shape for that case (HttpResponseError,
+        InvalidContentLength -- the exact error hit live earlier against the
+        unfixed whole-document case) and confirms it still surfaces as a
+        clean OcrError, not a raw azure.core exception leaking through."""
+        from azure.core.exceptions import HttpResponseError
+
+        def oversized_rejection(page_bytes):
+            raise HttpResponseError("(InvalidRequest) Invalid request. InvalidContentLength: The input image is too large.")
+
+        fake_error = SimpleNamespace(pages=[2], page_count=2)
+        with azure_env(), azure_stub(oversized_rejection):
+            with self.assertRaises(anydoc.OcrError) as caught:
+                anydoc._parse_ocr(MIXED.read_bytes(), fake_error)
+            self.assertNotIsInstance(caught.exception, HttpResponseError)
+            self.assertIn("InvalidContentLength", str(caught.exception))
+
+    def _fake_pages(self, *specs):
+        """Stands in for `extract_pages_markdown_bytes(...).pages`. Each spec
+        is (markdown, ocr_reason); pages are numbered 0-indexed in order, as
+        pdf-inspector numbers them."""
+        pages = [
+            SimpleNamespace(page=index, markdown=markdown, needs_ocr=not markdown.strip(), ocr_reason=reason)
+            for index, (markdown, reason) in enumerate(specs)
+        ]
+        return SimpleNamespace(pages=pages)
+
+    def test_an_unflagged_wiped_page_fails_the_call_instead_of_merging_empty(self):
+        """`extract_pages_markdown_bytes` blanks a page whose text it
+        distrusts. Until page health routes those pages to OCR they are not
+        in `error.pages`, so merging would silently drop real content -- the
+        one outcome this path must never produce. It must fail loudly, and
+        it must fail before paying Azure for the other pages."""
+        import pdf_inspector
+
+        fake_error = SimpleNamespace(pages=[1], page_count=3)
+        pages = self._fake_pages(("", None), ("native text\n", None), ("", "vector_text"))
+
+        with azure_env(), azure_stub(lambda page_bytes: self.fail("should not reach Azure")):
+            with patch.object(pdf_inspector, "extract_pages_markdown_bytes", return_value=pages):
+                with self.assertRaisesRegex(anydoc.OcrError, r"pages \[3\].*vector_text"):
+                    anydoc._parse_ocr(_blank_pdf(3), fake_error)
+
+    def test_a_genuinely_blank_page_is_not_mistaken_for_a_wiped_one(self):
+        """A blank page reports `needs_ocr` too, but states no reason. The
+        guard above must not reject a document for containing one."""
+        import pdf_inspector
+
+        fake_error = SimpleNamespace(pages=[1], page_count=3)
+        pages = self._fake_pages(("", None), ("native text\n", None), ("", None))
+
+        with azure_env(), azure_stub(lambda page_bytes: "OCR OF PAGE ONE\n"):
+            with patch.object(pdf_inspector, "extract_pages_markdown_bytes", return_value=pages):
+                result = anydoc._parse_ocr(_blank_pdf(3), fake_error)
+        self.assertIn("OCR OF PAGE ONE", result)
+        self.assertIn("native text", result)
+
+    def test_engine_selection_is_by_environment_and_names_no_engine_when_unset(self):
+        """`requested()` is the only thing that knows more than one engine
+        exists. With nothing configured it must return None so `to_markdown`
+        re-raises the original `NeedsOcrError` -- the unchanged-behaviour
+        promise for every caller who never asked for OCR."""
+        from anydoc.ocr_clients import requested
+
+        with azure_env(endpoint=None, key=None):
+            self.assertIsNone(requested())
+        with azure_env():
+            self.assertIs(requested(), __import__("anydoc.ocr_clients.azure_di", fromlist=["x"]))
+
+    def test_verify_single_page_accepts_one_page_rejects_more(self):
+        """Unit test of ocr_clients.base.verify_single_page in isolation,
+        against real PDF bytes -- not mocked, since pypdf's own page count
+        is exactly what's being trusted here."""
+        from anydoc.ocr_clients.base import verify_single_page
+
+        verify_single_page(_blank_pdf(1))  # does not raise
+
+        with self.assertRaisesRegex(ValueError, "expected exactly one page, got 2"):
+            verify_single_page(_blank_pdf(2))
+
+    def test_a_regressed_single_page_pdf_fails_the_call_instead_of_silently_corrupting(self):
+        """The actual point of verify_single_page: if _single_page_pdf (or
+        any future replacement) ever regressed to producing more than one
+        page, dispatch must fail loudly, not silently merge a multi-page
+        Azure result into a single array slot. Proven by making
+        _single_page_pdf actually misbehave (not simulated at a distance),
+        confirming both that it fails, and that it fails as OcrError."""
+        fake_error = SimpleNamespace(pages=[2], page_count=2)
+
+        with azure_env(), azure_stub(lambda page_bytes: "should never be reached"):
+            with patch("anydoc._single_page_pdf", return_value=_blank_pdf(2)):
+                with self.assertRaisesRegex(anydoc.OcrError, "expected exactly one page, got 2"):
+                    anydoc._parse_ocr(MIXED.read_bytes(), fake_error)
 
 
 if __name__ == "__main__":
