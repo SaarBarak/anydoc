@@ -1,0 +1,2 @@
+# local Azure DI credentials for manual/non-mocked OCR testing
+.env
