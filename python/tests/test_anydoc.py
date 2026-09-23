@@ -148,6 +148,14 @@ def azure_stub(analyze):
         yield spans
 
 
+# Synthetic page geometry. A page's *width* encodes its 1-indexed page
+# number -- page N is `_PAGE_WIDTH_BASE + N` points wide -- which is what lets
+# a stub identify which page it was handed without depending on any text
+# extraction. The height is fixed and carries no meaning.
+_PAGE_WIDTH_BASE = 200
+_PAGE_HEIGHT = 200
+
+
 def _blank_pdf(num_pages: int) -> bytes:
     """A real, valid multi-page PDF with no content -- enough for
     `_single_page_pdf` to slice and `pdf_inspector` to read, without needing
@@ -157,7 +165,7 @@ def _blank_pdf(num_pages: int) -> bytes:
 
     writer = PdfWriter()
     for _ in range(num_pages):
-        writer.add_blank_page(width=200, height=200)
+        writer.add_blank_page(width=_PAGE_WIDTH_BASE, height=_PAGE_HEIGHT)
     out = io.BytesIO()
     writer.write(out)
     return out.getvalue()
@@ -171,10 +179,18 @@ def _numbered_pdf(num_pages: int) -> bytes:
 
     writer = PdfWriter()
     for number in range(1, num_pages + 1):
-        writer.add_blank_page(width=200 + number, height=200)
+        writer.add_blank_page(width=_PAGE_WIDTH_BASE + number, height=_PAGE_HEIGHT)
     out = io.BytesIO()
     writer.write(out)
     return out.getvalue()
+
+
+def _page_number_of(page_pdf_bytes: bytes) -> int:
+    """The page number `_numbered_pdf` encoded in this single page's width."""
+    from pypdf import PdfReader
+
+    width = int(PdfReader(io.BytesIO(page_pdf_bytes)).pages[0].mediabox.width)
+    return width - _PAGE_WIDTH_BASE
 
 
 def _max_overlap(spans: list[tuple[float, float]]) -> int:
@@ -403,25 +419,43 @@ class AzureOcrTest(unittest.TestCase):
             result = anydoc._parse_ocr(MIXED.read_bytes(), [])
         self.assertIn("Text on the first page", result)
 
+    # Two more pages than the pool has workers, so the run needs a second
+    # batch and the queueing path is covered too. Derived from the real
+    # constant: raising `_MAX_WORKERS` must not quietly stop testing queueing.
+    CONCURRENCY_EXTRA_PAGES = 2
+    PER_CALL_SECONDS = 0.2
+
     def test_pages_dispatch_in_parallel_and_none_are_dropped(self):
-        n = 10  # > max_workers (8), so this also covers the queueing case
-        data = _blank_pdf(n)
+        page_count = anydoc._MAX_WORKERS + self.CONCURRENCY_EXTRA_PAGES
+        pages = list(range(1, page_count + 1))
+        # Two batches of work, plus generous slack for a loaded machine. Serial
+        # would take `page_count` calls end to end, which is far above this.
+        batches = -(-page_count // anydoc._MAX_WORKERS)
+        serial_seconds = page_count * self.PER_CALL_SECONDS
+        parallel_ceiling = batches * self.PER_CALL_SECONDS * 2.5
+        self.assertLess(parallel_ceiling, serial_seconds, "the bound cannot tell the two apart")
 
         def slow_analyze(page_bytes):
-            time.sleep(0.2)
+            time.sleep(self.PER_CALL_SECONDS)
             return "ok"
 
         with azure_env():
             t0 = time.monotonic()
             with azure_stub(slow_analyze) as spans:
-                anydoc._parse_ocr(data, list(range(1, n + 1)))
+                anydoc._parse_ocr(_blank_pdf(page_count), pages)
             elapsed = time.monotonic() - t0
 
-        self.assertEqual(len(spans), n)  # every page dispatched exactly once
-        # Serial would take n * 0.2s = 2.0s; 8-way parallel should finish in
-        # two batches, ~0.4s. Generous bound against CI jitter.
-        self.assertLess(elapsed, 1.0, f"took {elapsed:.2f}s -- looks serial, not parallel")
+        self.assertEqual(len(spans), page_count)  # every page dispatched exactly once
+        self.assertLess(
+            elapsed, parallel_ceiling, f"took {elapsed:.2f}s -- looks serial, not parallel"
+        )
         self.assertGreater(_max_overlap(spans), 1, "no real overlap between calls")
+
+    # Enough pages to interleave without making the test slow. Page 1 waits
+    # `PAGES * STEP` and page N waits `STEP`, so completion order is the exact
+    # reverse of dispatch order -- the worst case for a merge that trusted it.
+    ORDERING_PAGES = 5
+    ORDERING_DELAY_STEP_SECONDS = 0.05
 
     def test_results_land_by_page_number_even_when_they_finish_backwards(self):
         """Pages are OCR'd one per call but eight at a time, so they finish in
@@ -433,23 +467,21 @@ class AzureOcrTest(unittest.TestCase):
         writes each result to `merged[page_num - 1]` rather than appending.
         Here the stub finishes page 5 first and page 1 last -- the exact
         inversion -- and the document must still read 1, 2, 3, 4, 5."""
-        from pypdf import PdfReader
-
-        data = _numbered_pdf(5)
+        pages = list(range(1, self.ORDERING_PAGES + 1))
         finished = []
 
         def slow_for_early_pages(page_bytes):
-            width = int(PdfReader(io.BytesIO(page_bytes)).pages[0].mediabox.width)
-            page_num = width - 200
-            time.sleep(0.05 * (6 - page_num))  # page 1 sleeps longest
+            page_num = _page_number_of(page_bytes)
+            waits = self.ORDERING_PAGES + 1 - page_num  # page 1 waits longest
+            time.sleep(self.ORDERING_DELAY_STEP_SECONDS * waits)
             finished.append(page_num)
             return f"OCR-{page_num}\n"
 
         with azure_env(), azure_stub(slow_for_early_pages):
-            result = anydoc._parse_ocr(data, [1, 2, 3, 4, 5])
+            result = anydoc._parse_ocr(_numbered_pdf(self.ORDERING_PAGES), pages)
 
-        self.assertEqual(finished, [5, 4, 3, 2, 1], "the stub did not finish backwards")
-        positions = [result.index(f"OCR-{n}") for n in range(1, 6)]
+        self.assertEqual(finished, sorted(pages, reverse=True), "the stub did not finish backwards")
+        positions = [result.index(f"OCR-{n}") for n in pages]
         self.assertEqual(positions, sorted(positions), f"pages came out scrambled: {result!r}")
 
     def test_one_page_failing_fails_the_whole_call(self):
