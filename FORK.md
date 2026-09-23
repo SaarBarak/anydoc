@@ -6,7 +6,7 @@ Two things now, and they have different costs to maintain.
 
 1. **Wiring.** Redirects anydoc's PDF backend to a patched `pdf-inspector`
    build (see `SaarBarak/pdf-inspector`'s own `FORK.md`) that fixes
-   Hebrew/RTL text extraction. Cargo's `[patch.crates-io]` and the `azure`
+   Hebrew/RTL text extraction. Cargo's `[patch.crates-io]` and the `ocr`
    extra's pin in `python/pyproject.toml` both name that fork's tag, and
    both must move together — see "The pin is in two places" below.
 2. **Feature work.** Azure Document Intelligence OCR dispatch: when a PDF's
@@ -59,7 +59,7 @@ unlike `pdf-inspector`'s (see that repo's `FORK.md`).
 8. Azure Document Intelligence OCR dispatch (`feat/azure-ocr-dispatch`) —
    the first commits here to change anydoc's own behavior. Adds
    `anydoc/ocr_clients/`, the `ocr="reject"` escalation in
-   `anydoc/__init__.py`, and the `azure` extra. See "What this fork is for".
+   `anydoc/__init__.py`, and the `ocr`/`azure` extras. See "What this fork is for".
 
 ## The pin is in two places
 
@@ -68,7 +68,7 @@ unlike `pdf-inspector`'s (see that repo's `FORK.md`).
 | Consumer | Declared in | Resolves from |
 |---|---|---|
 | Rust core, links the crate | `Cargo.toml` `[patch.crates-io]` | the fork tag |
-| `_parse_azure`, imports the package | `python/pyproject.toml`, `azure` extra | the fork tag |
+| the OCR dispatch, imports the package | `python/pyproject.toml`, `ocr` extra | the fork tag |
 
 They were not always both redirected. The Python side carried a plain
 `pdf-inspector>=1.17.0`, which resolves from PyPI — upstream, without the
@@ -107,7 +107,7 @@ patch sets. Neither applies today — don't create one preemptively.
 ## If `pdf-inspector` cuts a new patch tag
 
 Bump **both** pins on `develop` to the new tag — `[patch.crates-io]` in
-`Cargo.toml` *and* the `azure` extra in `python/pyproject.toml`. Bumping
+`Cargo.toml` *and* the `ocr` extra in `python/pyproject.toml`. Bumping
 only the first is the bug described in "The pin is in two places": the Rust
 core moves to the new fork build while the Python side keeps resolving
 upstream from PyPI, and Hebrew comes back reversed from the Azure path.

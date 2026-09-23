@@ -25,6 +25,11 @@ def is_requested() -> bool:
     return bool(os.environ.get(ENDPOINT_ENV) or os.environ.get(KEY_ENV))
 
 
+def client() -> "AzureDiClient":
+    """This module's half of the engine contract -- see `ocr_clients`."""
+    return AzureDiClient.from_env()
+
+
 class AzureDiClient:
     """One Azure `prebuilt-layout` call per page. Construct via `from_env`,
     not directly -- that's where config validation and the optional-import

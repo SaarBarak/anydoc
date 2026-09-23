@@ -59,8 +59,8 @@ strip = "symbols"
 # match"). The fork tracks upstream's version, so keep it >= the requirement
 # and track the RTL-fix revision with the tag, never the crate version.
 #
-# This tag is pinned in a second place: `python/pyproject.toml`'s `azure`
-# extra. That extra exists because `_parse_azure` imports `pdf-inspector` as
+# This tag is pinned in a second place: `python/pyproject.toml`'s `ocr`
+# extra. That extra exists because the OCR dispatch imports `pdf-inspector` as
 # a Python package, which resolves independently of the crate this redirect
 # governs -- so the two halves of one install can sit on different versions.
 # They did: the crate carried the RTL fix and the Python package did not, and

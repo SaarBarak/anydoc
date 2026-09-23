@@ -254,7 +254,7 @@ class AnydocTest(unittest.TestCase):
         exported = {name for name in dir(anydoc._anydoc) if not name.startswith("_")}
         self.assertEqual(stubbed, exported)
         # __init__.py re-exports the whole module, plus what it adds itself.
-        self.assertEqual(set(anydoc.__all__), exported | {"Format", "HostedError", "AzureError", "Ocr"})
+        self.assertEqual(set(anydoc.__all__), exported | {"Format", "HostedError", "OcrError", "Ocr"})
 
 
 @unittest.skipUnless(_AZURE_EXTRA_INSTALLED, "azure extra not installed")
@@ -272,15 +272,15 @@ class AzureOcrTest(unittest.TestCase):
 
     def test_partial_config_raises_azure_error_immediately(self):
         with azure_env(endpoint="https://example.cognitiveservices.azure.com/", key=None):
-            with self.assertRaisesRegex(anydoc.AzureError, "both.*set; only one is"):
+            with self.assertRaisesRegex(anydoc.OcrError, "both.*set; only one is"):
                 anydoc.to_markdown_bytes(MIXED.read_bytes())
         with azure_env(endpoint=None, key="fake-key"):
-            with self.assertRaisesRegex(anydoc.AzureError, "both.*set; only one is"):
+            with self.assertRaisesRegex(anydoc.OcrError, "both.*set; only one is"):
                 anydoc.to_markdown_bytes(MIXED.read_bytes())
 
     def test_ocr_hosted_wins_even_when_azure_is_configured(self):
         reply = {"success": True, "data": {"markdown": HOSTED_MARKDOWN}}
-        with azure_env(), hosted_stub(200, reply) as hits, patch("anydoc._parse_azure") as mock_azure:
+        with azure_env(), hosted_stub(200, reply) as hits, patch("anydoc._parse_ocr") as mock_azure:
             result = anydoc.to_markdown(MIXED, ocr="hosted")
             self.assertEqual(result, HOSTED_MARKDOWN)
             mock_azure.assert_not_called()
@@ -294,14 +294,14 @@ class AzureOcrTest(unittest.TestCase):
 
     def test_extra_not_installed_raises_a_clean_azure_error(self):
         with azure_env(), patch.dict("sys.modules", {"azure.ai.documentintelligence": None}):
-            with self.assertRaisesRegex(anydoc.AzureError, r"pip install firecrawl-anydoc\[azure\]"):
+            with self.assertRaisesRegex(anydoc.OcrError, r"pip install firecrawl-anydoc\[azure\]"):
                 anydoc.to_markdown_bytes(MIXED.read_bytes())
 
     def test_page_number_outside_the_document_raises_azure_error_not_indexerror(self):
         fake_error = SimpleNamespace(pages=[99], page_count=2)
         with azure_env(), azure_stub(lambda page_bytes: "irrelevant"):
-            with self.assertRaises(anydoc.AzureError) as caught:
-                anydoc._parse_azure(MIXED.read_bytes(), fake_error)
+            with self.assertRaises(anydoc.OcrError) as caught:
+                anydoc._parse_ocr(MIXED.read_bytes(), fake_error)
             self.assertNotIsInstance(caught.exception, IndexError)
 
     def test_empty_pages_list_returns_the_document_unchanged(self):
@@ -311,7 +311,7 @@ class AzureOcrTest(unittest.TestCase):
             self.fail("should not call Azure for an empty page list")
 
         with azure_env(), azure_stub(fail_if_called):
-            result = anydoc._parse_azure(MIXED.read_bytes(), fake_error)
+            result = anydoc._parse_ocr(MIXED.read_bytes(), fake_error)
         self.assertIn("Text on the first page", result)
 
     def test_pages_dispatch_in_parallel_and_none_are_dropped(self):
@@ -326,7 +326,7 @@ class AzureOcrTest(unittest.TestCase):
         with azure_env():
             t0 = time.monotonic()
             with azure_stub(slow_analyze) as spans:
-                anydoc._parse_azure(data, fake_error)
+                anydoc._parse_ocr(data, fake_error)
             elapsed = time.monotonic() - t0
 
         self.assertEqual(len(spans), n)  # every page dispatched exactly once
@@ -350,8 +350,8 @@ class AzureOcrTest(unittest.TestCase):
             return "ok"
 
         with azure_env(), azure_stub(flaky_analyze):
-            with self.assertRaisesRegex(anydoc.AzureError, "simulated Azure failure"):
-                anydoc._parse_azure(data, fake_error)
+            with self.assertRaisesRegex(anydoc.OcrError, "simulated Azure failure"):
+                anydoc._parse_ocr(data, fake_error)
 
     def test_a_still_oversized_single_page_raises_a_clean_azure_error(self):
         """_single_page_pdf fixes the whole-document size limit (confirmed
@@ -362,7 +362,7 @@ class AzureOcrTest(unittest.TestCase):
         observed rejection shape for that case (HttpResponseError,
         InvalidContentLength -- the exact error hit live earlier against the
         unfixed whole-document case) and confirms it still surfaces as a
-        clean AzureError, not a raw azure.core exception leaking through."""
+        clean OcrError, not a raw azure.core exception leaking through."""
         from azure.core.exceptions import HttpResponseError
 
         def oversized_rejection(page_bytes):
@@ -370,8 +370,8 @@ class AzureOcrTest(unittest.TestCase):
 
         fake_error = SimpleNamespace(pages=[2], page_count=2)
         with azure_env(), azure_stub(oversized_rejection):
-            with self.assertRaises(anydoc.AzureError) as caught:
-                anydoc._parse_azure(MIXED.read_bytes(), fake_error)
+            with self.assertRaises(anydoc.OcrError) as caught:
+                anydoc._parse_ocr(MIXED.read_bytes(), fake_error)
             self.assertNotIsInstance(caught.exception, HttpResponseError)
             self.assertIn("InvalidContentLength", str(caught.exception))
 
@@ -398,8 +398,8 @@ class AzureOcrTest(unittest.TestCase):
 
         with azure_env(), azure_stub(lambda page_bytes: self.fail("should not reach Azure")):
             with patch.object(pdf_inspector, "extract_pages_markdown_bytes", return_value=pages):
-                with self.assertRaisesRegex(anydoc.AzureError, r"pages \[3\].*vector_text"):
-                    anydoc._parse_azure(_blank_pdf(3), fake_error)
+                with self.assertRaisesRegex(anydoc.OcrError, r"pages \[3\].*vector_text"):
+                    anydoc._parse_ocr(_blank_pdf(3), fake_error)
 
     def test_a_genuinely_blank_page_is_not_mistaken_for_a_wiped_one(self):
         """A blank page reports `needs_ocr` too, but states no reason. The
@@ -411,9 +411,21 @@ class AzureOcrTest(unittest.TestCase):
 
         with azure_env(), azure_stub(lambda page_bytes: "OCR OF PAGE ONE\n"):
             with patch.object(pdf_inspector, "extract_pages_markdown_bytes", return_value=pages):
-                result = anydoc._parse_azure(_blank_pdf(3), fake_error)
+                result = anydoc._parse_ocr(_blank_pdf(3), fake_error)
         self.assertIn("OCR OF PAGE ONE", result)
         self.assertIn("native text", result)
+
+    def test_engine_selection_is_by_environment_and_names_no_engine_when_unset(self):
+        """`requested()` is the only thing that knows more than one engine
+        exists. With nothing configured it must return None so `to_markdown`
+        re-raises the original `NeedsOcrError` -- the unchanged-behaviour
+        promise for every caller who never asked for OCR."""
+        from anydoc.ocr_clients import requested
+
+        with azure_env(endpoint=None, key=None):
+            self.assertIsNone(requested())
+        with azure_env():
+            self.assertIs(requested(), __import__("anydoc.ocr_clients.azure_di", fromlist=["x"]))
 
     def test_verify_single_page_accepts_one_page_rejects_more(self):
         """Unit test of ocr_clients.base.verify_single_page in isolation,
@@ -432,13 +444,13 @@ class AzureOcrTest(unittest.TestCase):
         page, dispatch must fail loudly, not silently merge a multi-page
         Azure result into a single array slot. Proven by making
         _single_page_pdf actually misbehave (not simulated at a distance),
-        confirming both that it fails, and that it fails as AzureError."""
+        confirming both that it fails, and that it fails as OcrError."""
         fake_error = SimpleNamespace(pages=[2], page_count=2)
 
         with azure_env(), azure_stub(lambda page_bytes: "should never be reached"):
             with patch("anydoc._single_page_pdf", return_value=_blank_pdf(2)):
-                with self.assertRaisesRegex(anydoc.AzureError, "expected exactly one page, got 2"):
-                    anydoc._parse_azure(MIXED.read_bytes(), fake_error)
+                with self.assertRaisesRegex(anydoc.OcrError, "expected exactly one page, got 2"):
+                    anydoc._parse_ocr(MIXED.read_bytes(), fake_error)
 
 
 if __name__ == "__main__":

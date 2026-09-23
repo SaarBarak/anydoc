@@ -39,8 +39,7 @@ from anydoc._anydoc import (
 )
 from anydoc._anydoc import to_markdown as _to_markdown
 from anydoc._anydoc import to_markdown_bytes as _to_markdown_bytes
-from anydoc.ocr_clients.azure_di import AzureDiClient
-from anydoc.ocr_clients.azure_di import is_requested as _azure_requested
+from anydoc.ocr_clients import requested as _ocr_requested
 from anydoc.ocr_clients.base import ClientConfigError, verify_single_page
 
 Format = Literal[
@@ -52,24 +51,31 @@ via `format_from_bytes` or `format_from_extension`."""
 
 Ocr = Literal["reject", "hosted"]
 """What happens to a PDF whose pages need OCR. `reject` (the default) raises
-`NeedsOcrError` naming the pages -- unless Azure Document Intelligence is
-configured (`AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT` and `_KEY` both set), in
-which case only those pages are recovered via Azure instead, and the rest of
-the document is untouched. `hosted` sends the whole document to Firecrawl
-Parse instead, keyless unless a key is given, regardless of Azure
-configuration. Documents anydoc converts itself never leave the machine
+`NeedsOcrError` naming the pages -- unless an OCR engine is configured, in
+which case only those pages are recovered through it and the rest of the
+document is untouched. `hosted` sends the whole document to Firecrawl Parse
+instead, keyless unless a key is given, and wins regardless of which engines
+are configured. Documents anydoc converts itself never leave the machine
 unless one of these applies.
 
-Azure requires the `azure` extra: `pip install firecrawl-anydoc[azure]`."""
+Engines are selected from the environment rather than by this argument, so
+existing callers keep working unchanged; `anydoc.ocr_clients` lists them and
+sets their precedence. Azure Document Intelligence
+(`AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT` and `_KEY`) is the one shipped today
+and needs the `azure` extra: `pip install firecrawl-anydoc[azure]`."""
 
 
 class HostedError(ConvertError):
     """`ocr="hosted"` could not get the document through Firecrawl Parse."""
 
 
-class AzureError(ConvertError):
-    """Azure Document Intelligence could not recover the pages that need
-    OCR, or `AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT`/`_KEY` are misconfigured."""
+class OcrError(ConvertError):
+    """An OCR engine could not recover the pages that need OCR, is
+    misconfigured, or the document lost pages that nothing recovered.
+
+    Engine-agnostic on purpose: which engine ran is a deployment detail, and
+    the failures worth catching -- no usable text came back -- are the same
+    whichever one did. `str(error)` names the engine where it is relevant."""
 
 
 def to_markdown(
@@ -92,8 +98,9 @@ def to_markdown(
         if ocr == "hosted":
             path = Path(path)
             return _parse_hosted(path.read_bytes(), path.name, api_key, api_url)
-        if _azure_requested():
-            return _parse_azure(Path(path).read_bytes(), error)
+        engine = _ocr_requested()
+        if engine is not None:
+            return _parse_ocr(Path(path).read_bytes(), error, engine)
         raise
 
 
@@ -114,8 +121,9 @@ def to_markdown_bytes(
     except NeedsOcrError as error:
         if ocr == "hosted":
             return _parse_hosted(bytes(data), "document.pdf", api_key, api_url)
-        if _azure_requested():
-            return _parse_azure(bytes(data), error)
+        engine = _ocr_requested()
+        if engine is not None:
+            return _parse_ocr(bytes(data), error, engine)
         raise
 
 
@@ -157,7 +165,7 @@ def _parse_hosted(data: bytes, filename: str, api_key: "str | None", api_url: "s
     return markdown if markdown.endswith("\n") else markdown + "\n"
 
 
-_AZURE_MAX_WORKERS = 8
+_MAX_WORKERS = 8
 
 
 # `data` is guaranteed to be PDF bytes here, not just assumed: NeedsOcr is
@@ -165,21 +173,26 @@ _AZURE_MAX_WORKERS = 8
 # no other format parser has any such logic, so this function can only
 # ever be reached via a PDF.
 #
-# Only the pages NeedsOcrError named go to Azure, not the whole document:
-# unlike Parse, prebuilt-layout takes a page selection. One job per page,
-# never a page range -- see AzureDiClient.ocr_page for why.
-def _parse_azure(data: bytes, error: NeedsOcrError) -> str:
+# Only the pages NeedsOcrError named are sent, not the whole document. One
+# job per page, never a page range -- see `OcrClient.ocr_page` for why.
+#
+# Engine-agnostic: everything here is page slicing, dispatch, reindexing and
+# merging, and the only engine-shaped operations are constructing the client
+# and calling `ocr_page`, both behind `ocr_clients.base.OcrClient`. Adding an
+# engine means writing a client module, never touching this function.
+def _parse_ocr(data: bytes, error: NeedsOcrError, engine=None) -> str:
+    engine = engine if engine is not None else _ocr_requested()
     try:
-        client = AzureDiClient.from_env()
+        client = engine.client()
     except ClientConfigError as exc:
-        raise AzureError(str(exc)) from exc
+        raise OcrError(str(exc)) from exc
 
     try:
         import pdf_inspector
     except ImportError as exc:
-        raise AzureError(
-            "Azure Document Intelligence OCR requires the 'azure' extra: "
-            "pip install firecrawl-anydoc[azure]"
+        raise OcrError(
+            "OCR needs the page reader from the 'ocr' extra: "
+            "pip install firecrawl-anydoc[ocr]"
         ) from exc
 
     # Unrestricted read of every page's native text, in document order --
@@ -219,7 +232,7 @@ def _parse_azure(data: bytes, error: NeedsOcrError) -> str:
         if page.page + 1 not in flagged and not page.markdown.strip() and page.ocr_reason
     ]
     if dropped:
-        raise AzureError(
+        raise OcrError(
             f"pages {dropped} lost their text to pdf-inspector's own suppression "
             f"and were not flagged for OCR; returning the document would drop them "
             f"silently. Reasons: "
@@ -232,10 +245,10 @@ def _parse_azure(data: bytes, error: NeedsOcrError) -> str:
         return client.ocr_page(page_bytes)
 
     try:
-        with ThreadPoolExecutor(max_workers=_AZURE_MAX_WORKERS) as pool:
+        with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:
             results = list(pool.map(_dispatch, error.pages))
     except Exception as exc:
-        raise AzureError(f"Azure Document Intelligence: {exc}") from exc
+        raise OcrError(f"{engine.__name__.rsplit('.', 1)[-1]}: {exc}") from exc
 
     for page_num, markdown in zip(error.pages, results):
         merged[page_num - 1] = markdown  # error.pages is 1-indexed, merged is 0-indexed
@@ -250,12 +263,12 @@ def _single_page_pdf(data: bytes, page_num: int) -> bytes:
     confirmed live: a 5.1MB, 138-page document was rejected outright asking
     for one page. Sending only that page's own bytes keeps every request
     small regardless of source size. Module-level (not nested in
-    `_parse_azure`) so tests can call or patch it directly.
+    `_parse_ocr`) so tests can call or patch it directly.
 
     Known limitations, not yet addressed:
     - Fixes the whole-document case only. A single page can in principle
       still be too large on its own (e.g. one very high-resolution scan) --
-      that surfaces as a generic AzureError via _parse_azure's exception
+      that surfaces as a generic OcrError via _parse_ocr's exception
       wrapper (see test_a_still_oversized_single_page_raises_a_clean_azure_error),
       not a distinct, more actionable one.
     - Azure's documented size ceiling (checked against current Microsoft
@@ -331,7 +344,7 @@ def _version() -> str:
 
 __all__ = [
     "Asset",
-    "AzureError",
+    "OcrError",
     "Block",
     "Cell",
     "CellSlot",
