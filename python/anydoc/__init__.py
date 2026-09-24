@@ -238,7 +238,13 @@ def _route(data: bytes, already_flagged: "list[int]") -> "list[int]":
 # real multi-page document -- and D7 (no partial degrade) means that single 429
 # fails the whole file, not just the one page. Lower this to fit the engine's
 # actual quota rather than the document's page count.
-_MAX_WORKERS = int(os.environ.get("ANYDOC_OCR_MAX_WORKERS", "8"))
+#
+# `or "8"`, not a plain default arg: a container that declares this var in its
+# `environment:` block without a host-side value set (common with a Compose
+# `${ANYDOC_OCR_MAX_WORKERS:-}` default) gets the var present but empty, not
+# absent -- os.environ.get's own default only fires when the key is missing
+# entirely, and `int("")` raises. Empty is treated the same as unset.
+_MAX_WORKERS = int(os.environ.get("ANYDOC_OCR_MAX_WORKERS") or "8")
 
 
 # `data` is guaranteed to be PDF bytes here, not just assumed: NeedsOcr is
