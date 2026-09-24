@@ -60,6 +60,20 @@ unlike `pdf-inspector`'s (see that repo's `FORK.md`).
    the first commits here to change anydoc's own behavior. Adds
    `anydoc/ocr_clients/`, the `ocr="reject"` escalation in
    `anydoc/__init__.py`, and the `ocr`/`azure` extras. See "What this fork is for".
+9. Per-page extraction-health routing (`feat/page-health`,
+   `feat/page-health-routing`, PRs #2 and #6) — flags pages the native
+   extractor silently wiped or blanked and routes those specific pages to
+   OCR instead of the whole document.
+10. Bump both `pdf-inspector` pins from `v1.17.0-rtl-fix.2` to
+    `v1.17.0-fork.1` — the first tag under that fork's new naming (see
+    "If `pdf-inspector` cuts a new patch tag" below for why). No RTL-fix
+    content changed; the new tag is `v1.17.0-rtl-fix.2` plus a build-only
+    patch that lets the Python bindings compile without the native OCR
+    path (99 crates instead of 262, no ONNX/PDFium/TLS) — exactly the
+    install cost this repo's `ocr` extra pays on every install. Verified:
+    `cargo test` (Rust), the Python suite installed both bare and with
+    `[ocr,azure]`, and a from-source build of the git-tag dependency
+    (`pdf-inspector` compiles clean in ~1 minute cold).
 
 ## The pin is in two places
 
@@ -235,7 +249,13 @@ believing a Hebrew result.
 
 This repo's own test suite doesn't cover Hebrew — the real regression gate
 is `tests/test_document_parser.py` in `SysAgentsHarness`. Tag the result
-`vX.Y.Z-rtl-fix.N` once that passes.
+`vX.Y.Z-fork.N` once that passes — not `-rtl-fix.N`. That suffix named this
+fork's first patch, not what a tag off `develop` actually is now that it
+also carries the OCR dispatch and page-health routing (unrelated to RTL);
+`pdf-inspector`'s own fork made the identical correction for the identical
+reason (see its `FORK.md`, "Tag naming"). Existing `-rtl-fix.N` tags on
+this repo stay as they are — immutable history, still referenced by name
+from `SysAgentsHarness`'s and this repo's own install docs.
 
 ## If we ever need a newer anydoc upstream base
 

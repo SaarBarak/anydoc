@@ -67,4 +67,4 @@ strip = "symbols"
 # Hebrew came back character-reversed from whichever path went through
 # Python. Move both pins together, always.
 [patch.crates-io]
-pdf-inspector = { git = "https://github.com/SaarBarak/pdf-inspector.git", tag = "v1.17.0-rtl-fix.2" }
+pdf-inspector = { git = "https://github.com/SaarBarak/pdf-inspector.git", tag = "v1.17.0-fork.1" }

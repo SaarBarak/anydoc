@@ -50,14 +50,22 @@ v<upstream-version>-rtl-fix.<n>
 Both forks use this same scheme, so a glance at the tags tells you which
 upstream release each is sitting on and whether they agree.
 
+**Superseded from `v1.17.0-fork.1` on.** `-rtl-fix.N` named this fork's
+first patch; it stopped fitting once each fork carried patches that are not
+RTL fixes (the Python-bindings feature split on the pdf-inspector side, the
+Azure OCR dispatch and page-health routing on the anydoc side). Both forks'
+`FORK.md` now use `v<upstream-version>-fork.<n>` instead — same idea, tag
+names the fork's role rather than whichever patch came first. Existing
+`-rtl-fix.N` tags below are unchanged; they are immutable history.
+
 Current alignment:
 
-| Repo                     | Upstream base | RTL-fix tag         | Pinned SHA |
-| ------------------------ | ------------- | ------------------- | ---------- |
-| `SaarBarak/pdf-inspector`| 1.17.0        | `v1.17.0-rtl-fix.2` | `f5ff9f7f` |
-| `SaarBarak/anydoc`       | 0.2.4         | `v1.17.0-rtl-fix.2` | this branch |
+| Repo                      | Upstream base | Fork tag           | Pinned SHA |
+| ------------------------- | -------------- | ------------------- | ---------- |
+| `SaarBarak/pdf-inspector` | 1.17.0          | `v1.17.0-fork.1`    | `cfc86792` |
+| `SaarBarak/anydoc`        | 0.2.4           | `v1.17.0-fork.1`    | this branch |
 
-The two repos share the RTL-fix tag name but sit on different upstream
+The two repos share the fork tag name but sit on different upstream
 versions — the tag names the pdf-inspector base, because that is what the
 patch pins.
 
@@ -69,6 +77,7 @@ patch pins.
 | `v0.1.8-rtl-fix.2`  | Recovers CIDs a `/ToUnicode` CMap never names, via the embedded font's cmap |
 | `v1.17.0-rtl-fix.1` | Adopts upstream's own RTL fix; retires our `src/rtl.rs`; keeps the CID fix and adds a UAX #9 number-separator fix |
 | `v1.17.0-rtl-fix.2` | Adds an orthographic override for documents upstream's visual/logical verdict gets wrong |
+| `v1.17.0-fork.1`    | No RTL content. Lets the Python bindings build without the native OCR path (`python = ["pyo3"]`, 99 crates instead of 262) — the anydoc fork's Python `ocr` extra now pays that cost instead of pulling in ONNX/PDFium/TLS on every install |
 
 ### Why `.1` was retired
 
@@ -225,16 +234,19 @@ Exits non-zero if the patch silently fell out of the build. It checks two
 things: that `pdf-inspector` resolves to our git fork in `Cargo.lock`, and that
 Hebrew text actually comes out in logical order.
 
-## Adding a new RTL-fix patch
+## Adding a new fork patch
+
+Use `-fork.N`, not `-rtl-fix.N` — see "Superseded from `v1.17.0-fork.1` on"
+above.
 
 1. Commit the fix on the fork's branch (e.g. `SaarBarak/pdf-inspector`).
 2. Confirm `package.version` still satisfies the requirement in this
    repo's `Cargo.toml` (`^1.14.2` today).
-3. Tag and push: `git tag -a v1.17.0-rtl-fix.2 -m "..." && git push origin v1.17.0-rtl-fix.2`
+3. Tag and push: `git tag -a v1.17.0-fork.2 -m "..." && git push origin v1.17.0-fork.2`
 4. Update the `tag = ` line in this repo's `[patch.crates-io]`.
 5. `cargo update -p pdf-inspector` to refresh the pinned SHA in `Cargo.lock`.
 6. Re-run the verification, commit `Cargo.toml` + `Cargo.lock`, tag this repo
-   `v1.17.0-rtl-fix.2` as well.
+   `v1.17.0-fork.2` as well.
 
 Keep the two tags in lockstep — same tag name in both repos means they were
 built and validated together.

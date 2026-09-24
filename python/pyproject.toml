@@ -49,7 +49,7 @@ dynamic = ["version"]
 # redirected. One version, nothing to keep in sync, and no direct reference.
 [project.optional-dependencies]
 ocr = [
-    "pdf-inspector @ git+https://github.com/SaarBarak/pdf-inspector.git@v1.17.0-rtl-fix.2",
+    "pdf-inspector @ git+https://github.com/SaarBarak/pdf-inspector.git@v1.17.0-fork.1",
     "pypdf>=5.0",
 ]
 azure = [
