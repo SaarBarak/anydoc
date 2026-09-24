@@ -232,7 +232,13 @@ def _route(data: bytes, already_flagged: "list[int]") -> "list[int]":
     return sorted(set(already_flagged) | set(_health_pages(data)))
 
 
-_MAX_WORKERS = 8
+# Overridable per deployment: 8 assumes headroom the OCR engine's own tier/quota
+# actually has. A low-tier resource (e.g. Azure Document Intelligence's free F0,
+# 20 calls/minute) hits 429 well before 8 concurrent per-page jobs finish on any
+# real multi-page document -- and D7 (no partial degrade) means that single 429
+# fails the whole file, not just the one page. Lower this to fit the engine's
+# actual quota rather than the document's page count.
+_MAX_WORKERS = int(os.environ.get("ANYDOC_OCR_MAX_WORKERS", "8"))
 
 
 # `data` is guaranteed to be PDF bytes here, not just assumed: NeedsOcr is
