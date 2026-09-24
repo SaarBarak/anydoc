@@ -972,7 +972,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 [[package]]
 name = "pdf-inspector"
 version = "1.17.0"
-source = "git+https://github.com/SaarBarak/pdf-inspector.git?tag=v1.17.0-rtl-fix.2#f5ff9f7f420024f6af6e4478af412936cb14a8f1"
+source = "git+https://github.com/SaarBarak/pdf-inspector.git?tag=v1.17.0-fork.1#cfc86792b733e2e8a6afd985c255cfea18f473f4"
 dependencies = [
  "env_logger",
  "include_dir",
