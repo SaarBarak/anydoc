@@ -8,6 +8,7 @@ import re
 import threading
 import time
 import unittest
+import urllib.error
 import zipfile
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -16,6 +17,8 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import anydoc
+from anydoc.ocr_clients import tesseract as tesseract_mod
+from anydoc.ocr_clients import vlm as vlm_mod
 
 REPO = Path(__file__).resolve().parents[2]
 FIXTURES = REPO / "tests" / "fixtures"
@@ -52,6 +55,26 @@ try:
     _PDF_LIBS_INSTALLED = _PDF_INSPECTOR_INSTALLED
 except ImportError:
     _PDF_LIBS_INSTALLED = False
+
+# tesseract and vlm both render a page to pixels before doing anything
+# engine-specific -- gate on the renderer alone (shared by both) plus each
+# engine's own SDK.
+try:
+    import pypdfium2  # noqa: F401
+
+    _PYPDFIUM2_INSTALLED = True
+except ImportError:
+    _PYPDFIUM2_INSTALLED = False
+
+try:
+    import pytesseract  # noqa: F401
+
+    _PYTESSERACT_INSTALLED = True
+except ImportError:
+    _PYTESSERACT_INSTALLED = False
+
+_TESSERACT_EXTRA_INSTALLED = _PYPDFIUM2_INSTALLED and _PYTESSERACT_INSTALLED
+_VLM_EXTRA_INSTALLED = _PYPDFIUM2_INSTALLED
 
 
 @contextmanager
@@ -146,6 +169,103 @@ def azure_stub(analyze):
 
     with patch.object(adi, "DocumentIntelligenceClient", _FakeClient):
         yield spans
+
+
+@contextmanager
+def tesseract_env(enabled="1", lang=None, cmd=None):
+    """Sets (or, if None, clears) Tesseract's env vars, restoring whatever
+    was there after."""
+    names = (tesseract_mod.ENABLED_ENV, tesseract_mod.LANG_ENV, tesseract_mod.CMD_ENV)
+    saved = {name: os.environ.pop(name, None) for name in names}
+    if enabled is not None:
+        os.environ[tesseract_mod.ENABLED_ENV] = enabled
+    if lang is not None:
+        os.environ[tesseract_mod.LANG_ENV] = lang
+    if cmd is not None:
+        os.environ[tesseract_mod.CMD_ENV] = cmd
+    try:
+        yield
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+@contextmanager
+def tesseract_stub(image_to_string, version="5.0.0"):
+    """A stand-in for the `pytesseract` module-level calls `TesseractClient`
+    makes, patched at their origin so lazy imports elsewhere pick them up.
+    Never invokes the real binary. `image_to_string(image, lang=...) -> str`
+    runs once per page with the real `PIL.Image` `_render.render_page_to_image`
+    actually produced (rendering itself is not mocked)."""
+    import pytesseract
+
+    with (
+        patch.object(pytesseract, "get_tesseract_version", lambda: version),
+        patch.object(pytesseract, "image_to_string", image_to_string),
+    ):
+        yield
+
+
+@contextmanager
+def vlm_env(base_url="not-yet-set", api_key="fake-key", model="fake-vlm-model"):
+    """Sets (or, if None, clears) the VLM env vars, restoring whatever was
+    there after. `base_url="not-yet-set"` is replaced with the real stub
+    server's URL by `vlm_stub` -- passing a concrete value here is only for
+    tests that never actually call out."""
+    names = (vlm_mod.BASE_URL_ENV, vlm_mod.API_KEY_ENV, vlm_mod.MODEL_ENV)
+    saved = {name: os.environ.pop(name, None) for name in names}
+    if base_url is not None:
+        os.environ[vlm_mod.BASE_URL_ENV] = base_url
+    if api_key is not None:
+        os.environ[vlm_mod.API_KEY_ENV] = api_key
+    if model is not None:
+        os.environ[vlm_mod.MODEL_ENV] = model
+    try:
+        yield
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+@contextmanager
+def vlm_stub(reply_text, model="fake-vlm-model"):
+    """A stand-in for an OpenAI-compatible Chat Completions endpoint,
+    answering every request with one reply and recording each hit's parsed
+    JSON body. Sets `VLM_OCR_BASE_URL` (and `_MODEL`) to the stub's own
+    address -- the real `_render.render_page_to_image` and HTTP round-trip
+    both run for real, only the model's answer is canned."""
+    hits = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            payload = json.loads(self.rfile.read(int(self.headers.get("content-length", 0))))
+            hits.append(payload)
+            reply = json.dumps(
+                {"choices": [{"message": {"content": reply_text}}]}
+            ).encode()
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(reply)))
+            self.end_headers()
+            self.wfile.write(reply)
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    with vlm_env(base_url=f"http://127.0.0.1:{server.server_port}", model=model):
+        try:
+            yield hits
+        finally:
+            server.shutdown()
+            server.server_close()
 
 
 # Synthetic page geometry. A page's *width* encodes its 1-indexed page
@@ -565,6 +685,179 @@ class AzureOcrTest(unittest.TestCase):
             with patch("anydoc._single_page_pdf", return_value=_blank_pdf(2)):
                 with self.assertRaisesRegex(anydoc.OcrError, "expected exactly one page, got 2"):
                     anydoc._parse_ocr(MIXED.read_bytes(), [2])
+
+
+@unittest.skipUnless(_TESSERACT_EXTRA_INSTALLED, "tesseract extra not installed")
+class TesseractOcrTest(unittest.TestCase):
+    """Tesseract-specific coverage. The dispatch/merge/concurrency machinery
+    is engine-agnostic and already covered end to end by `AzureOcrTest` --
+    this only exercises what's actually different about this engine: its
+    opt-in-flag "configured" signal (not credentials), its own missing-extra
+    message, and that it really renders a page before OCRing it."""
+
+    def test_disabled_raises_the_original_needs_ocr_error_unchanged(self):
+        with tesseract_env(enabled=None):
+            with self.assertRaises(anydoc.NeedsOcrError) as caught:
+                anydoc.to_markdown(MIXED)
+            self.assertEqual(caught.exception.pages, [2])
+
+    def test_ocr_hosted_wins_even_when_tesseract_is_enabled(self):
+        reply = {"success": True, "data": {"markdown": HOSTED_MARKDOWN}}
+        with tesseract_env(), hosted_stub(200, reply) as hits, patch("anydoc._parse_ocr") as mock_ocr:
+            result = anydoc.to_markdown(MIXED, ocr="hosted")
+            self.assertEqual(result, HOSTED_MARKDOWN)
+            mock_ocr.assert_not_called()
+            self.assertEqual(hits, [("/v2/parse", True)])
+
+    def test_tesseract_replaces_only_the_flagged_page(self):
+        with tesseract_env(), tesseract_stub(lambda image, lang: "TESSERACT OCR TEXT\n"):
+            result = anydoc.to_markdown_bytes(MIXED.read_bytes())
+        self.assertIn("Text on the first page", result)  # untouched native page
+        self.assertIn("TESSERACT OCR TEXT", result)  # the flagged page, replaced
+
+    def test_lang_env_reaches_image_to_string(self):
+        seen = {}
+
+        def image_to_string(image, lang):
+            seen["lang"] = lang
+            return "ok"
+
+        with tesseract_env(lang="eng+heb"), tesseract_stub(image_to_string):
+            anydoc._parse_ocr(MIXED.read_bytes(), [2])
+        self.assertEqual(seen["lang"], "eng+heb")
+
+    def test_extra_not_installed_raises_a_clean_tesseract_error(self):
+        with tesseract_env(), patch.dict("sys.modules", {"pytesseract": None}):
+            with self.assertRaisesRegex(anydoc.OcrError, r"pip install firecrawl-anydoc\[tesseract\]"):
+                anydoc.to_markdown_bytes(MIXED.read_bytes())
+
+    def test_missing_binary_raises_a_clean_tesseract_error(self):
+        import pytesseract
+
+        def not_found():
+            raise pytesseract.TesseractNotFoundError()
+
+        with tesseract_env(), patch.object(pytesseract, "get_tesseract_version", not_found):
+            with self.assertRaisesRegex(anydoc.OcrError, "needs the 'tesseract' binary"):
+                anydoc.to_markdown_bytes(MIXED.read_bytes())
+
+    def test_engine_selection_prefers_tesseract_only_when_nothing_else_configured(self):
+        from anydoc.ocr_clients import azure_di, requested
+
+        with azure_env(endpoint=None, key=None), tesseract_env(enabled=None):
+            self.assertIsNone(requested())
+        with azure_env(endpoint=None, key=None), tesseract_env():
+            self.assertIs(requested(), tesseract_mod)
+        # Azure outranks Tesseract in `_ENGINES` -- both configured, Azure wins.
+        with azure_env(), tesseract_env():
+            self.assertIs(requested(), azure_di)
+
+
+@unittest.skipUnless(_VLM_EXTRA_INSTALLED, "vlm extra (pypdfium2) not installed")
+class VlmOcrTest(unittest.TestCase):
+    """VLM-specific coverage. As with `TesseractOcrTest`, the dispatch/merge/
+    concurrency machinery is already covered by `AzureOcrTest` -- this
+    exercises what's different: three-var "configured" detection, the HTTP
+    request/response shape, and that a rendered image actually goes out."""
+
+    def test_unconfigured_raises_the_original_needs_ocr_error_unchanged(self):
+        with vlm_env(base_url=None, api_key=None, model=None):
+            with self.assertRaises(anydoc.NeedsOcrError) as caught:
+                anydoc.to_markdown(MIXED)
+            self.assertEqual(caught.exception.pages, [2])
+
+    def test_partial_config_raises_vlm_error_immediately(self):
+        with vlm_env(base_url="http://example.invalid/v1", api_key=None, model=None):
+            with self.assertRaisesRegex(anydoc.OcrError, "both.*set; only one is"):
+                anydoc.to_markdown_bytes(MIXED.read_bytes())
+
+    def test_ocr_hosted_wins_even_when_vlm_is_configured(self):
+        reply = {"success": True, "data": {"markdown": HOSTED_MARKDOWN}}
+        with vlm_env(base_url="http://example.invalid/v1"), hosted_stub(200, reply) as hits:
+            with patch("anydoc._parse_ocr") as mock_ocr:
+                result = anydoc.to_markdown(MIXED, ocr="hosted")
+                self.assertEqual(result, HOSTED_MARKDOWN)
+                mock_ocr.assert_not_called()
+                self.assertEqual(hits, [("/v2/parse", True)])
+
+    def test_vlm_replaces_only_the_flagged_page(self):
+        with vlm_stub("VLM OCR TEXT\n"):
+            result = anydoc.to_markdown_bytes(MIXED.read_bytes())
+        self.assertIn("Text on the first page", result)  # untouched native page
+        self.assertIn("VLM OCR TEXT", result)  # the flagged page, replaced
+
+    def test_request_carries_the_configured_model_and_an_image(self):
+        with vlm_stub("ok", model="my-vision-model") as hits:
+            anydoc._parse_ocr(MIXED.read_bytes(), [2])
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["model"], "my-vision-model")
+        content = hits[0]["messages"][0]["content"]
+        image_parts = [part for part in content if part["type"] == "image_url"]
+        self.assertEqual(len(image_parts), 1)
+        self.assertTrue(image_parts[0]["image_url"]["url"].startswith("data:image/png;base64,"))
+
+    def test_no_api_key_omits_the_authorization_header(self):
+        hits = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("content-length", 0))
+                self.rfile.read(length)
+                hits.append(dict(self.headers.items()))
+                reply = json.dumps({"choices": [{"message": {"content": "ok"}}]}).encode()
+                self.send_response(200)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(reply)))
+                self.end_headers()
+                self.wfile.write(reply)
+
+            def log_message(self, *args):
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            with vlm_env(base_url=f"http://127.0.0.1:{server.server_port}", api_key=None):
+                anydoc._parse_ocr(MIXED.read_bytes(), [2])
+        finally:
+            server.shutdown()
+            server.server_close()
+        self.assertNotIn("Authorization", hits[0])
+
+    def test_http_error_raises_a_clean_vlm_error_not_a_raw_urlerror(self):
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("content-length", 0))
+                self.rfile.read(length)
+                body = b'{"error": "rate limited"}'
+                self.send_response(429)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            with vlm_env(base_url=f"http://127.0.0.1:{server.server_port}"):
+                with self.assertRaises(anydoc.OcrError) as caught:
+                    anydoc._parse_ocr(MIXED.read_bytes(), [2])
+                self.assertNotIsInstance(caught.exception, urllib.error.URLError)
+                self.assertIn("429", str(caught.exception))
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_engine_selection_is_by_environment(self):
+        from anydoc.ocr_clients import requested
+
+        with azure_env(endpoint=None, key=None), vlm_env(base_url=None, api_key=None, model=None):
+            self.assertIsNone(requested())
+        with azure_env(endpoint=None, key=None), vlm_env():
+            self.assertIs(requested(), vlm_mod)
 
 
 @unittest.skipUnless(_PDF_LIBS_INSTALLED, "pdf-inspector/pypdf not installed")

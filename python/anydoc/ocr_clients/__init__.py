@@ -1,5 +1,5 @@
-"""OCR engine clients: one module per engine (`azure_di.py`, and in future
-`tesseract.py` etc.).
+"""OCR engine clients: one module per engine (`azure_di.py`, `tesseract.py`,
+`vlm.py`).
 
 Each engine module exposes two things, which is the whole contract:
 
@@ -21,14 +21,16 @@ level and defers its own third-party imports into `client()` and the client's
 methods. So this package stays importable with no extra installed; only
 constructing or using a client needs one."""
 
-from anydoc.ocr_clients import azure_di
+from anydoc.ocr_clients import azure_di, tesseract, vlm
 
 __all__ = ["requested"]
 
 # Precedence order. The first engine that looks configured wins, so a
 # deployment with two sets of credentials present gets a defined answer
-# rather than whichever import happened first.
-_ENGINES = (azure_di,)
+# rather than whichever import happened first. Cloud engines (needing
+# explicit credentials to even look "requested") come before Tesseract,
+# whose one opt-in flag is otherwise the least specific signal of the three.
+_ENGINES = (azure_di, vlm, tesseract)
 
 
 def requested():

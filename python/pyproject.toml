@@ -57,6 +57,21 @@ azure = [
     "azure-ai-documentintelligence>=1.0.2",
 ]
 
+# `tesseract` and `vlm` both need pixels, not just PDF bytes -- azure_di hands
+# Azure the page's own PDF bytes directly, so `pypdfium2`/`Pillow` (rendering)
+# belong to these two extras, not to the shared `ocr` extra above.
+tesseract = [
+    "firecrawl-anydoc[ocr]",
+    "pytesseract>=0.3",
+    "pypdfium2>=4",
+    "Pillow>=10",
+]
+vlm = [
+    "firecrawl-anydoc[ocr]",
+    "pypdfium2>=4",
+    "Pillow>=10",
+]
+
 [project.urls]
 Homepage = "https://github.com/firecrawl/anydoc#readme"
 Repository = "https://github.com/firecrawl/anydoc"

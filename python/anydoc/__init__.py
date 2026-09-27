@@ -60,9 +60,11 @@ unless one of these applies.
 
 Engines are selected from the environment rather than by this argument, so
 existing callers keep working unchanged; `anydoc.ocr_clients` lists them and
-sets their precedence. Azure Document Intelligence
-(`AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT` and `_KEY`) is the one shipped today
-and needs the `azure` extra: `pip install firecrawl-anydoc[azure]`."""
+sets their precedence. Three are shipped today: Azure Document Intelligence
+(`AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT`/`_KEY`, the `azure` extra), an
+OpenAI-compatible VLM (`VLM_OCR_BASE_URL`/`_API_KEY`/`_MODEL`, the `vlm`
+extra), and Tesseract, a local/offline engine (`TESSERACT_OCR_ENABLED`, the
+`tesseract` extra)."""
 
 
 class HostedError(ConvertError):
