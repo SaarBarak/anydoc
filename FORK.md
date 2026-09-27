@@ -9,11 +9,13 @@ Two things now, and they have different costs to maintain.
    Hebrew/RTL text extraction. Cargo's `[patch.crates-io]` and the `ocr`
    extra's pin in `python/pyproject.toml` both name that fork's tag, and
    both must move together — see "The pin is in two places" below.
-2. **Feature work.** Azure Document Intelligence OCR dispatch: when a PDF's
-   scanned pages would otherwise raise `NeedsOcrError`, they are recovered
-   page by page and merged back, and the rest of the document never leaves
-   the machine. This is anydoc's own Python source, changed here and not
-   upstream.
+2. **Feature work.** OCR dispatch: when a PDF's scanned pages would
+   otherwise raise `NeedsOcrError`, they are recovered page by page (via
+   whichever engine in `ocr_clients` is configured — Azure Document
+   Intelligence, an OpenAI-compatible VLM, or local/offline Tesseract) and
+   merged back; the rest of the document never leaves the machine, and
+   neither does any of it when Tesseract is the configured engine. This is
+   anydoc's own Python source, changed here and not upstream.
 
 **This fork used to say its own source was unmodified from upstream, and
 that rebasing was therefore close to conflict-free. That stopped being true
@@ -74,6 +76,16 @@ unlike `pdf-inspector`'s (see that repo's `FORK.md`).
     `cargo test` (Rust), the Python suite installed both bare and with
     `[ocr,azure]`, and a from-source build of the git-tag dependency
     (`pdf-inspector` compiles clean in ~1 minute cold).
+11. `03c4363` — Tesseract and VLM OCR engine clients (`feat/tesseract-vlm-ocr-engines`)
+    — two more `ocr_clients` engines beside `azure_di`: `tesseract` (local,
+    offline, opts in via `TESSERACT_OCR_ENABLED` since it has no credentials
+    to gate on) and `vlm` (any OpenAI-compatible vision Chat Completions
+    endpoint, `VLM_OCR_BASE_URL`/`_API_KEY`/`_MODEL`, over stdlib `urllib`
+    like `_parse_hosted`). Both render a page to pixels first (new
+    `ocr_clients/_render.py`, `pypdfium2`), which `azure_di` never needed —
+    new `tesseract`/`vlm` extras carry that rendering dependency instead of
+    the shared `ocr` extra. `_ENGINES` precedence: `azure_di`, `vlm`,
+    `tesseract`.
 
 ## The pin is in two places
 
