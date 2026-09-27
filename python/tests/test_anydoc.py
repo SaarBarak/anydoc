@@ -193,18 +193,33 @@ def tesseract_env(enabled="1", lang=None, cmd=None):
                 os.environ[name] = value
 
 
+_OSD_NO_ROTATION = (
+    "Page number: 0\nOrientation in degrees: 0\nRotate: 0\n"
+    "Orientation confidence: 10.00\nScript: Latin\nScript confidence: 1.00\n"
+)
+
+
 @contextmanager
-def tesseract_stub(image_to_string, version="5.0.0"):
+def tesseract_stub(image_to_string, version="5.0.0", osd=_OSD_NO_ROTATION):
     """A stand-in for the `pytesseract` module-level calls `TesseractClient`
     makes, patched at their origin so lazy imports elsewhere pick them up.
     Never invokes the real binary. `image_to_string(image, lang=...) -> str`
     runs once per page with the real `PIL.Image` `_render.render_page_to_image`
-    actually produced (rendering itself is not mocked)."""
+    actually produced (rendering itself is not mocked). `osd` is
+    `image_to_osd`'s canned reply -- realistic "no rotation" text by default,
+    or a `pytesseract.TesseractError` instance to simulate OSD refusing
+    outright (a near-blank/low-text page)."""
     import pytesseract
+
+    def image_to_osd(*_args, **_kwargs):
+        if isinstance(osd, Exception):
+            raise osd
+        return osd
 
     with (
         patch.object(pytesseract, "get_tesseract_version", lambda: version),
         patch.object(pytesseract, "image_to_string", image_to_string),
+        patch.object(pytesseract, "image_to_osd", image_to_osd),
     ):
         yield
 
@@ -725,6 +740,65 @@ class TesseractOcrTest(unittest.TestCase):
         with tesseract_env(lang="eng+heb"), tesseract_stub(image_to_string):
             anydoc._parse_ocr(MIXED.read_bytes(), [2])
         self.assertEqual(seen["lang"], "eng+heb")
+
+    # Deliberately not square, so a 90/270-degree rotation is provable by
+    # size alone: only a real rotation swaps width and height.
+    _ROTATION_TEST_SIZE = (300, 150)
+
+    def test_a_page_osd_flags_as_rotated_is_rotated_before_ocr(self):
+        from PIL import Image
+
+        original = Image.new("L", self._ROTATION_TEST_SIZE)
+        captured = {}
+
+        def image_to_string(image, lang):
+            captured["size"] = image.size
+            return "ok"
+
+        with tesseract_env(), tesseract_stub(image_to_string, osd="Rotate: 90\n"):
+            with patch("anydoc.ocr_clients._render.render_page_to_image", return_value=original):
+                anydoc._parse_ocr(MIXED.read_bytes(), [2])
+
+        self.assertEqual(
+            captured["size"],
+            self._ROTATION_TEST_SIZE[::-1],
+            "OSD reported a 90-degree rotation, but width/height weren't swapped before OCR",
+        )
+
+    def test_a_page_osd_reports_no_rotation_is_passed_through_unchanged(self):
+        from PIL import Image
+
+        original = Image.new("L", self._ROTATION_TEST_SIZE)
+        captured = {}
+
+        def image_to_string(image, lang):
+            captured["size"] = image.size
+            return "ok"
+
+        with tesseract_env(), tesseract_stub(image_to_string):  # default osd: no rotation
+            with patch("anydoc.ocr_clients._render.render_page_to_image", return_value=original):
+                anydoc._parse_ocr(MIXED.read_bytes(), [2])
+
+        self.assertEqual(captured["size"], self._ROTATION_TEST_SIZE)
+
+    def test_osd_refusing_on_a_low_text_page_falls_back_to_unrotated_not_a_crash(self):
+        import pytesseract
+        from PIL import Image
+
+        original = Image.new("L", self._ROTATION_TEST_SIZE)
+        captured = {}
+
+        def image_to_string(image, lang):
+            captured["size"] = image.size
+            return "ok"
+
+        osd_refusal = pytesseract.TesseractError(1, "Too few characters. Skipping this page")
+        with tesseract_env(), tesseract_stub(image_to_string, osd=osd_refusal):
+            with patch("anydoc.ocr_clients._render.render_page_to_image", return_value=original):
+                result = anydoc._parse_ocr(MIXED.read_bytes(), [2])
+
+        self.assertEqual(captured["size"], self._ROTATION_TEST_SIZE, "OSD refusing must not trigger a rotation")
+        self.assertIn("ok", result)
 
     def test_extra_not_installed_raises_a_clean_tesseract_error(self):
         with tesseract_env(), patch.dict("sys.modules", {"pytesseract": None}):

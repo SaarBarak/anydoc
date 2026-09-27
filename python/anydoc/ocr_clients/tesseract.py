@@ -1,8 +1,11 @@
 """Tesseract OCR client -- a local, offline engine: no cloud credentials, no
 per-page network cost, and no data ever leaving the machine, at the expense
-of accuracy against a cloud engine on messy scans. Everything Tesseract- and
-image-rendering-specific lives here -- anydoc/__init__.py's orchestration
-knows nothing about either, only the `OcrClient` protocol.
+of accuracy against a cloud engine on messy scans. Every page is passed
+through Tesseract's own OSD (orientation and script detection) before the
+real OCR call, and rotated to match -- see `TesseractClient._detect_rotation`
+for why this isn't optional. Everything Tesseract- and image-rendering-
+specific lives here -- anydoc/__init__.py's orchestration knows nothing
+about either, only the `OcrClient` protocol.
 
 All third-party imports are lazy, inside methods, not at module level: this
 module must stay importable (for `is_requested`, which only needs
@@ -10,6 +13,7 @@ module must stay importable (for `is_requested`, which only needs
 constructing or using a client should ever require it."""
 
 import os
+import re
 
 from anydoc.ocr_clients.base import ClientConfigError
 
@@ -18,6 +22,15 @@ LANG_ENV = "TESSERACT_OCR_LANG"
 CMD_ENV = "TESSERACT_CMD"
 
 _DEFAULT_LANG = "eng"
+
+# Tesseract's own OSD (orientation and script detection) output includes a
+# line like "Rotate: 90" -- degrees to rotate the image clockwise to correct
+# its reading orientation. This is a real, measured failure mode, not a
+# hypothetical: a live 95-page tender had 43 of 53 flagged pages rendered
+# sideways (content-level rotation inside the page's own drawing commands,
+# not a PDF /Rotate flag pdfium would already apply), which a single
+# uncorrected OCR pass reads as near-total garbage.
+_OSD_ROTATE = re.compile(r"Rotate: (\d+)")
 
 
 def is_requested() -> bool:
@@ -71,4 +84,27 @@ class TesseractClient:
         from anydoc.ocr_clients._render import render_page_to_image
 
         image = render_page_to_image(page_pdf_bytes)
+        angle = self._detect_rotation(image)
+        if angle:
+            image = image.rotate(-angle, expand=True)
         return pytesseract.image_to_string(image, lang=self._lang)
+
+    @staticmethod
+    def _detect_rotation(image) -> int:
+        """Degrees to rotate `image` clockwise before OCRing it, or 0.
+        Unconditional, not opt-in: the extra OSD pass costs roughly as much
+        again as the real OCR call (measured: +61% total time across 53
+        pages), which is trivial for a local, free engine next to what a
+        wrong orientation actually costs -- unreadable text with no error
+        raised to say so. OSD can refuse outright on a near-blank or
+        low-text page (`TesseractError`); that means "nothing to orient
+        from", not a page worth failing the whole call over, so it is
+        treated the same as "no rotation detected"."""
+        import pytesseract
+
+        try:
+            osd = pytesseract.image_to_osd(image)
+        except pytesseract.TesseractError:
+            return 0
+        match = _OSD_ROTATE.search(osd)
+        return int(match.group(1)) if match else 0
