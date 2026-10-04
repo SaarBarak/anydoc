@@ -193,6 +193,39 @@ def _page_number_of(page_pdf_bytes: bytes) -> int:
     return width - _PAGE_WIDTH_BASE
 
 
+def _curve_pdf(curve_ops: int, text: str = "hello") -> bytes:
+    """A real, valid one-page PDF with one real text-show operator (so
+    `native_chars` is nonzero) plus exactly `curve_ops` degenerate,
+    zero-length curve operators in its content stream. `scan_pdf_health`
+    only regexes for standalone `c` tokens, so geometry is irrelevant --
+    this gives CURVE_FLOOR an exact, controllable input without needing a
+    handcrafted fixture file for every value tested."""
+    from pypdf import PdfWriter
+    from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
+
+    writer = PdfWriter()
+    page = writer.add_blank_page(width=_PAGE_WIDTH_BASE, height=_PAGE_HEIGHT)
+    font = DictionaryObject(
+        {
+            NameObject("/Type"): NameObject("/Font"),
+            NameObject("/Subtype"): NameObject("/Type1"),
+            NameObject("/BaseFont"): NameObject("/Helvetica"),
+        }
+    )
+    font_ref = writer._add_object(font)
+    page[NameObject("/Resources")] = DictionaryObject(
+        {NameObject("/Font"): DictionaryObject({NameObject("/F1"): font_ref})}
+    )
+    curves = "0 0 0 0 0 0 c\n" * curve_ops
+    stream = f"BT /F1 12 Tf 10 100 Td ({text}) Tj ET\n{curves}".encode()
+    stream_obj = DecodedStreamObject()
+    stream_obj.set_data(stream)
+    page[NameObject("/Contents")] = writer._add_object(stream_obj)
+    out = io.BytesIO()
+    writer.write(out)
+    return out.getvalue()
+
+
 def _page_health():
     """The module to patch `scan_pdf_health` on. Imported lazily, since it
     needs the `ocr` extra's PDF libraries."""
@@ -712,6 +745,35 @@ class PageHealthTest(unittest.TestCase):
         self.assertGreaterEqual(outlined.curve_ops, 500)
         self.assertIn("outlined_text", outlined.reasons)
         self.assertTrue(outlined.needs_ocr)
+
+    def test_a_short_outlined_run_below_the_old_ratio_is_now_caught(self):
+        """The ratio this signal used to require (curves > text_ops * 10)
+        missed real, confirmed text loss on a real tender: a short outlined
+        run -- one lost sentence, not a whole outlined page -- sitting
+        inside an otherwise normal, text-heavy page barely moves either
+        number. 150 curve operators against one text-show operator would
+        have passed the floor (150 < 500) AND failed the old ratio check
+        here regardless, so this is squarely the gap CURVE_FLOOR=100 closes,
+        not a case the ratio ever would have caught."""
+        from anydoc.page_health import scan_pdf_health
+
+        page = scan_pdf_health(_curve_pdf(150))[0]
+        self.assertGreater(page.native_chars, 0, "the page's own real text must still be seen")
+        self.assertIn("outlined_text", page.reasons)
+        self.assertTrue(page.needs_ocr)
+
+    def test_a_small_incidental_curve_count_still_stays_clean(self):
+        """Not every page with a handful of curve operators lost anything --
+        a bullet glyph or a decorative rule can legitimately draw a few.
+        Hand-verified on a real 95-page tender: two clean pages measured 16
+        and 20 curve operators respectively, nothing missing on either
+        against the rendered page, and nothing in that document sits between
+        21 and 200. CURVE_FLOOR=100 sits in that gap on purpose."""
+        from anydoc.page_health import scan_pdf_health
+
+        page = scan_pdf_health(_curve_pdf(20))[0]
+        self.assertNotIn("outlined_text", page.reasons)
+        self.assertFalse(page.needs_ocr)
 
     def test_a_ruled_table_page_is_not_mistaken_for_outlined_text(self):
         """The control, and the reason B is usable on a corpus of ruled

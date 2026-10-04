@@ -16,13 +16,17 @@ A. `cmap_corruption_ratio` -- characters that decoded to something unmappable
    repairable in principle; by the time we see it, pdf-inspector's own CID
    recovery has already run and failed.
 
-B. `outlined_text` -- the page draws far more Bezier curves than its text
-   operators can account for. Glyphs converted to filled paths at export time
-   carry no font, no character code and no text operator: they render
-   perfectly and extract as nothing, and no parser can ever recover them.
-   Table rules and cell borders are straight lines and rectangles and produce
-   no curve at all, which is what keeps this from firing on ruled tables.
-   **This is the only signal that justifies an OCR call.**
+B. `outlined_text` -- the page draws more Bezier curves than CURVE_FLOOR.
+   Glyphs converted to filled paths at export time carry no font, character
+   code or text operator: they render fine and extract as nothing, and no
+   parser can recover them. Table rules and borders are lines and rectangles,
+   not curves, so ruled tables don't trigger it.
+
+   It is an absolute floor, not a ratio against text operators, because a
+   short outlined run inside a text-heavy page barely moves a ratio. The
+   accepted cost: a page with unrelated vector art (a logo) can trigger an
+   unnecessary OCR call. That is cheaper than a silently wrong compliance
+   answer.
 
 C. `markdown_wiped` -- `extract_pages_markdown_bytes()` blanked a page whose
    text the positions API can still see. That is our toolchain over-reacting,
@@ -72,12 +76,12 @@ _IMAGE_PLACEHOLDER = re.compile(r"\[Image:[^\]]*\]")
 _CURVE_OP = re.compile(rb"(?<![A-Za-z0-9])c(?![A-Za-z0-9])")
 _TEXT_SHOW_OP = re.compile(rb"(?<![A-Za-z0-9])(Tj|TJ|'|\")(?![A-Za-z0-9])")
 
-# Calibrated against one 95-page tender, where clean pages topped out at 499
-# curves and damaged ones started at 512. They will not transfer unchanged --
-# recalibrate against the real corpus before relying on them.
+# Calibrated against a single 95-page tender; recalibrate on the real corpus.
 CMAP_CORRUPTION_MAX = 0.03
-CURVE_FLOOR = 500
-CURVES_PER_TEXT_OP = 10.0
+
+# On that tender, clean pages had at most 20 curves and every confirmed-damaged
+# page had 201+, with nothing in between. 100 sits mid-gap.
+CURVE_FLOOR = 100
 
 REASON_CMAP = "cmap_corruption"
 REASON_OUTLINED = "outlined_text"
@@ -177,7 +181,7 @@ def scan_pdf_health(data: bytes) -> "list[PageHealth]":
         reasons = []
         if ratio > CMAP_CORRUPTION_MAX:
             reasons.append(REASON_CMAP)
-        if curves >= CURVE_FLOOR and curves > shows * CURVES_PER_TEXT_OP:
+        if curves >= CURVE_FLOOR:
             reasons.append(REASON_OUTLINED)
         # A page that draws something but yields no characters has lost
         # whatever it draws, whatever the reason. This catches the cover page
