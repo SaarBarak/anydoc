@@ -308,6 +308,7 @@ def _parse_ocr(
 
     def _dispatch(page_num: int) -> "tuple[str, float]":
         started = time.monotonic()
+        tracker.page_started(page_num)
         page_bytes = _single_page_pdf(data, page_num)
         verify_single_page(page_bytes)
         markdown = client.ocr_page(page_bytes)
@@ -328,7 +329,7 @@ def _parse_ocr(
             futures = {pool.submit(_dispatch, page_num): page_num for page_num in pages_needing_ocr}
             for future in as_completed(futures):
                 by_page[futures[future]], seconds = future.result()
-                tracker.page_done(seconds)
+                tracker.page_done(futures[future], seconds)
                 if report:
                     _notify(report, tracker.progress())
     except Exception as exc:
