@@ -84,7 +84,14 @@ class EtaTracker:
         starts = starts[: self._workers]
         free = [max(start + mean, now + self._OVERDUE_FLOOR * mean) for start in starts]
         free += [now] * (self._workers - len(free))
+        # Queued pages, one mean each, go to the earliest-free worker. Free
+        # times span at most one mean (an in-flight page started no later than
+        # now), so every full round of `workers` queued pages adds exactly one
+        # page to every worker: skip those rounds arithmetically and replay
+        # only the remainder. Bounded by `workers` whatever `pages_total` says.
+        rounds, rest = divmod(max(0, remaining - len(starts)), self._workers)
+        free = [t + rounds * mean for t in free]
         heapq.heapify(free)
-        for _ in range(remaining - len(starts)):
+        for _ in range(rest):
             heapq.heappush(free, heapq.heappop(free) + mean)
         return max(0.0, max(free) - now)

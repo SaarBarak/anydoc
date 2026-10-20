@@ -1057,6 +1057,44 @@ class OcrProgressTest(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertEqual(tracker.progress().pages_done, sum(begun))
 
+    def test_the_queue_arithmetic_matches_replaying_every_page(self):
+        import heapq
+        import random
+        from anydoc.progress import EtaTracker
+
+        rng = random.Random(359)
+        for _ in range(300):
+            workers, mean = rng.randint(1, 8), rng.uniform(0.5, 2.0)
+            running = rng.randint(0, workers)
+            queued = rng.randint(0, 60)
+            now = [100.0]
+            tracker = EtaTracker("sim", 1000, workers, clock=lambda: now[0])
+            tracker.page_done(0, mean)
+            starts = [100.0 - rng.uniform(0, 1.5) * mean for _ in range(running)]
+            for page, start in enumerate(starts, 1):
+                now[0] = start
+                tracker.page_started(page)
+            now[0] = 100.0
+            tracker._total = 1 + running + queued
+            free = [max(s + mean, 100.0 + 0.1 * mean) for s in starts] + [100.0] * (workers - running)
+            heapq.heapify(free)
+            for _ in range(queued):
+                heapq.heappush(free, heapq.heappop(free) + mean)
+            self.assertAlmostEqual(tracker.progress().eta_s, max(free) - 100.0)
+
+    def test_a_nonsense_page_total_cannot_hang_the_estimate(self):
+        from anydoc.progress import EtaTracker
+
+        for total in (1, 10**12):  # fewer than done, and absurdly many
+            tracker = EtaTracker("sim", total, 8)
+            for page in range(5):
+                tracker.page_started(page)
+                tracker.page_done(page, 1.0)
+            t0 = time.monotonic()
+            event = tracker.progress()
+            self.assertLess(time.monotonic() - t0, 1.0, f"total={total} took too long")
+            self.assertGreaterEqual(event.eta_s, 0)
+
     def test_the_tracker_replays_in_flight_pages_then_queued_ones(self):
         from anydoc.progress import EtaTracker
 
