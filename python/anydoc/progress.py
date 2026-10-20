@@ -1,6 +1,7 @@
 """Progress reporting for page-level OCR."""
 
 import heapq
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -24,7 +25,9 @@ class OcrProgress:
 
 class EtaTracker:
     """Builds `OcrProgress` events from per-page wall times. Workers call
-    `page_started`; everything else is only touched from the calling thread.
+    `page_started`; the calling thread does the rest. A lock guards the shared
+    state, and the ETA is computed from a copy taken under it, so correctness
+    does not lean on the GIL.
 
     The ETA replays the rest of the run as list scheduling. Each in-flight
     page is expected to finish `mean` after it started (never sooner than a
@@ -50,28 +53,35 @@ class EtaTracker:
         self._workers = workers
         self._clock = clock
         self._started = clock()
-        self._page_seconds: "list[float]" = []
-        self._in_flight: "dict[int, float]" = {}  # page -> start; written by workers
+        self._lock = threading.Lock()
+        self._done = 0
+        self._seconds = 0.0  # summed wall time of completed pages
+        self._in_flight: "dict[int, float]" = {}  # page -> start
 
     def page_started(self, page: int) -> None:
-        self._in_flight[page] = self._clock()
+        start = self._clock()
+        with self._lock:
+            self._in_flight[page] = start
 
     def page_done(self, page: int, seconds: float) -> None:
-        self._in_flight.pop(page, None)
-        self._page_seconds.append(seconds)
+        with self._lock:
+            self._in_flight.pop(page, None)
+            self._done += 1
+            self._seconds += seconds
 
     def progress(self) -> OcrProgress:
         now = self._clock()
-        done = len(self._page_seconds)
+        with self._lock:
+            done, seconds = self._done, self._seconds
+            starts = list(self._in_flight.values())
         remaining = self._total - done
         eta = None
         if done:
-            eta = self._eta(now, remaining) if remaining else 0.0
+            eta = self._eta(now, remaining, seconds / done, starts) if remaining else 0.0
         return OcrProgress("ocr", self._engine, done, self._total, now - self._started, eta)
 
-    def _eta(self, now: float, remaining: int) -> float:
-        mean = sum(self._page_seconds) / len(self._page_seconds)
-        starts = tuple(self._in_flight.values())[: self._workers]
+    def _eta(self, now: float, remaining: int, mean: float, starts: "list[float]") -> float:
+        starts = starts[: self._workers]
         free = [max(start + mean, now + self._OVERDUE_FLOOR * mean) for start in starts]
         free += [now] * (self._workers - len(free))
         heapq.heapify(free)
