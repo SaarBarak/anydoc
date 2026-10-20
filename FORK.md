@@ -74,6 +74,15 @@ unlike `pdf-inspector`'s (see that repo's `FORK.md`).
     `cargo test` (Rust), the Python suite installed both bare and with
     `[ocr,azure]`, and a from-source build of the git-tag dependency
     (`pdf-inspector` compiles clean in ~1 minute cold).
+11. OCR progress callback (`feat/ocr-progress-eta`) — optional keyword-only
+    `on_progress` on `to_markdown` and `to_markdown_bytes`, called with a
+    frozen `OcrProgress` (new `anydoc/progress.py`, with the ETA tracker)
+    before the first page and after each one. `_parse_ocr` now uses
+    `submit` + `as_completed` consumed on the calling thread instead of
+    `pool.map`, so callbacks never run on a pool worker; output and merge
+    order are unchanged, engines are untouched, and `ocr="hosted"` reports
+    nothing. Additive, but it is more of our own `anydoc/__init__.py` to
+    merge on the next upstream rebase.
 
 ## The pin is in two places
 

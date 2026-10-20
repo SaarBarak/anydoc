@@ -1,11 +1,14 @@
 """Convert documents to GitHub-Flavored Markdown."""
 
 import json
+import logging
 import os
+import time
 import urllib.error
 import urllib.request
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from importlib.metadata import PackageNotFoundError, version
 from io import BytesIO
 from pathlib import Path
@@ -41,6 +44,7 @@ from anydoc._anydoc import to_markdown as _to_markdown
 from anydoc._anydoc import to_markdown_bytes as _to_markdown_bytes
 from anydoc.ocr_clients import requested as _ocr_requested
 from anydoc.ocr_clients.base import ClientConfigError, verify_single_page
+from anydoc.progress import EtaTracker, OcrProgress
 
 Format = Literal[
     "doc", "docx", "odt", "pdf", "ppt", "pptx", "rtf", "epub", "xlsx", "ods", "odp", "csv"
@@ -84,6 +88,7 @@ def to_markdown(
     ocr: Ocr = "reject",
     api_key: "str | None" = None,
     api_url: "str | None" = None,
+    on_progress: "Callable[[OcrProgress], None] | None" = None,
 ) -> str:
     """Convert a document file to Markdown. The format is detected from the
     file content; the extension is the fallback for signature-less formats
@@ -91,7 +96,11 @@ def to_markdown(
 
     For `ocr="hosted"`, `api_key` falls back to `FIRECRAWL_API_KEY`, then
     keyless; `api_url` to `FIRECRAWL_API_URL`, then
-    `https://api.firecrawl.dev`."""
+    `https://api.firecrawl.dev`.
+
+    `on_progress` is called with an `OcrProgress` before OCR starts and after
+    each page completes, always on the calling thread. It is only for pages
+    recovered through an OCR engine; `ocr="hosted"` reports nothing."""
     try:
         markdown = _to_markdown(path)
     except NeedsOcrError as error:
@@ -102,14 +111,14 @@ def to_markdown(
         if engine is None:
             raise
         data = Path(path).read_bytes()
-        return _parse_ocr(data, _route(data, error.pages), engine)
+        return _parse_ocr(data, _route(data, error.pages), engine, on_progress=on_progress)
     if ocr != "hosted":
         engine = _ocr_requested()
         if engine is not None:
             data = Path(path).read_bytes()
             flagged = _health_pages(data)
             if flagged:
-                return _parse_ocr(data, flagged, engine)
+                return _parse_ocr(data, flagged, engine, on_progress=on_progress)
     return markdown
 
 
@@ -120,11 +129,12 @@ def to_markdown_bytes(
     ocr: Ocr = "reject",
     api_key: "str | None" = None,
     api_url: "str | None" = None,
+    on_progress: "Callable[[OcrProgress], None] | None" = None,
 ) -> str:
     """Convert an in-memory document to Markdown. Without a format, it is
     detected from the content, which signature-less formats (CSV) have to
     name explicitly. `ocr`, `api_key` and `api_url` are as for
-    `to_markdown`."""
+    `to_markdown`, as is `on_progress`."""
     try:
         markdown = _to_markdown_bytes(data, format)
     except NeedsOcrError as error:
@@ -133,7 +143,7 @@ def to_markdown_bytes(
         engine = _ocr_requested()
         if engine is None:
             raise
-        return _parse_ocr(bytes(data), _route(bytes(data), error.pages), engine)
+        return _parse_ocr(bytes(data), _route(bytes(data), error.pages), engine, on_progress=on_progress)
     # A document that converted without raising can still have lost text: the
     # core's check only fires when a page yields nothing at all, and a page
     # whose glyphs were converted to outlines renders perfectly and extracts
@@ -146,7 +156,7 @@ def to_markdown_bytes(
         if engine is not None:
             flagged = _health_pages(bytes(data))
             if flagged:
-                return _parse_ocr(bytes(data), flagged, engine)
+                return _parse_ocr(bytes(data), flagged, engine, on_progress=on_progress)
     return markdown
 
 
@@ -244,6 +254,7 @@ def _route(data: bytes, already_flagged: "list[int]") -> "list[int]":
 # `${ANYDOC_OCR_MAX_WORKERS:-}` default) gets the var present but empty, not
 # absent -- os.environ.get's own default only fires when the key is missing
 # entirely, and `int("")` raises. Empty is treated the same as unset.
+_log = logging.getLogger(__name__)
 _MAX_WORKERS = int(os.environ.get("ANYDOC_OCR_MAX_WORKERS") or "8")
 
 
@@ -259,7 +270,13 @@ _MAX_WORKERS = int(os.environ.get("ANYDOC_OCR_MAX_WORKERS") or "8")
 # merging, and the only engine-shaped operations are constructing the client
 # and calling `ocr_page`, both behind `ocr_clients.base.OcrClient`. Adding an
 # engine means writing a client module, never touching this function.
-def _parse_ocr(data: bytes, pages_needing_ocr: "list[int]", engine=None) -> str:
+def _parse_ocr(
+    data: bytes,
+    pages_needing_ocr: "list[int]",
+    engine=None,
+    *,
+    on_progress: "Callable[[OcrProgress], None] | None" = None,
+) -> str:
     engine = engine if engine is not None else _ocr_requested()
     try:
         client = engine.client()
@@ -289,22 +306,49 @@ def _parse_ocr(data: bytes, pages_needing_ocr: "list[int]", engine=None) -> str:
     pages = pdf_inspector.extract_pages_markdown_bytes(data).pages
     merged = [page.markdown for page in pages]
 
-    def _dispatch(page_num: int) -> str:
+    def _dispatch(page_num: int) -> "tuple[str, float]":
+        started = time.monotonic()
         page_bytes = _single_page_pdf(data, page_num)
         verify_single_page(page_bytes)
-        return client.ocr_page(page_bytes)
+        markdown = client.ocr_page(page_bytes)
+        return markdown, time.monotonic() - started
 
+    engine_name = engine.__name__.rsplit(".", 1)[-1]
+    tracker = EtaTracker(engine_name, len(pages_needing_ocr), _MAX_WORKERS)
+    report = on_progress if pages_needing_ocr else None
+    if report:
+        _notify(report, tracker.progress())
+
+    # Workers only OCR. Every callback fires here, on the calling thread, as
+    # futures complete, so consumers never need a lock. The first failed page
+    # raises out of the loop and no further event is emitted.
+    by_page: "dict[int, str]" = {}
     try:
         with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:
-            results = list(pool.map(_dispatch, pages_needing_ocr))
+            futures = {pool.submit(_dispatch, page_num): page_num for page_num in pages_needing_ocr}
+            for future in as_completed(futures):
+                by_page[futures[future]], seconds = future.result()
+                tracker.page_done(seconds)
+                if report:
+                    _notify(report, tracker.progress())
     except Exception as exc:
-        raise OcrError(f"{engine.__name__.rsplit('.', 1)[-1]}: {exc}") from exc
+        raise OcrError(f"{engine_name}: {exc}") from exc
+    results = [by_page[page_num] for page_num in pages_needing_ocr]
 
     for page_num, markdown in zip(pages_needing_ocr, results):
         merged[page_num - 1] = markdown  # the page list is 1-indexed, merged is 0-indexed
 
     joined = "\n\n".join(merged)
     return joined if joined.endswith("\n") else joined + "\n"
+
+
+def _notify(on_progress: "Callable[[OcrProgress], None]", event: OcrProgress) -> None:
+    """Progress is advisory: a callback that raises must never fail the
+    conversion, so it is logged and swallowed."""
+    try:
+        on_progress(event)
+    except Exception:
+        _log.exception("on_progress callback raised; ignoring")
 
 
 def _single_page_pdf(data: bytes, page_num: int) -> bytes:
@@ -413,6 +457,7 @@ __all__ = [
     "NeedsOcrError",
     "Note",
     "Ocr",
+    "OcrProgress",
     "ResourceLimitError",
     "Style",
     "Table",

@@ -60,6 +60,17 @@ Engines are selected from the environment, not from an argument, so nothing chan
 pip install firecrawl-anydoc[azure]
 ```
 
+### Progress
+
+Pass `on_progress` to follow a long OCR job. It is called with an `OcrProgress` before the first page is sent (`pages_done=0`) and after each page completes, always on the calling thread, so it needs no locking. `eta_s` is an estimate, and `None` until the first page is done; `pages_total` counts the pages sent to OCR, not the pages in the document. A callback that raises is logged and ignored. `ocr="hosted"` reports nothing, and neither does a document with no pages to OCR.
+
+```python
+def show(p: anydoc.OcrProgress) -> None:
+    print(f"{p.pages_done}/{p.pages_total}", "?" if p.eta_s is None else f"~{p.eta_s:.0f}s left")
+
+markdown = anydoc.to_markdown("scan.pdf", on_progress=show)
+```
+
 ## Errors
 
 A conversion raises only when no complete Markdown could come out of the file. The exception type names what went wrong:
