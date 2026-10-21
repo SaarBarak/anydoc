@@ -83,6 +83,23 @@ unlike `pdf-inspector`'s (see that repo's `FORK.md`).
     order are unchanged, engines are untouched, and `ocr="hosted"` reports
     nothing. Additive, but it is more of our own `anydoc/__init__.py` to
     merge on the next upstream rebase.
+12. Azure rate-limit handling (`fix/azure-ocr-rate-limit`) — the free tier (F0,
+    20 calls a minute) was tripped by the SDK's own polling and the run failed
+    after 9 silent minutes. `ocr_clients/azure_di.py` now puts one policy in the
+    SDK's retry loop (via `custom_hook_policy`; the generated client ignores
+    `per_retry_policies`) that enforces a per-page deadline, spaces every
+    request through one shared limiter, handles 429 itself (waits the capped
+    `Retry-After`, retries a bounded number of times) and drops the service's
+    `Retry-After` on polls so `polling_interval` really applies. New settings
+    `ANYDOC_AZURE_TIER` (auto/free/paid; `auto` switches to the free profile
+    when a 429 names F0), `ANYDOC_OCR_POLL_SECONDS`,
+    `ANYDOC_OCR_CALLS_PER_MINUTE`, `ANYDOC_OCR_PAGE_TIMEOUT_SECONDS`; see the
+    README. `OcrProgress` gains `rate_limited_s: float | None = None`, sent on
+    an extra event while a worker waits. Workers hand the notice to the calling
+    thread through a queue (`_parse_ocr` now polls `wait(..., timeout)`
+    instead of `as_completed`), so callbacks still never run on a pool worker.
+    A failing page now also cancels pages not yet started. More of our own
+    `__init__.py` and `azure_di.py` to merge on a rebase.
 
 ## The pin is in two places
 

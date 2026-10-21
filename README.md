@@ -144,6 +144,23 @@ anydoc reads text-based PDFs locally but does no OCR, so a PDF with scanned or i
 
 Only documents that need OCR leave the machine, and the whole document goes, since Parse has no page selection. If Parse cannot convert it, Node rejects with `code: 'hosted'` and Python raises `HostedError`. `--api-url`, `apiUrl` and `api_url`, else `FIRECRAWL_API_URL`, point at another Parse deployment. The Rust crate has no `ocr` option and never makes network calls.
 
+### Azure Document Intelligence rate limits (Python, this fork)
+
+With `AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT` and `_KEY` set, scanned pages go to Azure one page per call. Azure's free tier (F0) allows 20 calls a minute, and every "done yet?" check counts. These environment variables (empty means unset) keep a run under the limit:
+
+| Variable | Default | What it does |
+| -------- | ------- | ------------ |
+| `ANYDOC_AZURE_TIER` | `auto` | `free`, `paid` or `auto`. The tier cannot be read from the key. `auto` starts on the paid profile and switches to the free one when Azure's own 429 names F0; `free` uses it from the start. Either logs one warning. |
+| `ANYDOC_OCR_POLL_SECONDS` | free 4, paid 1 | How often to ask whether a page is done. The service's `Retry-After` on a poll is ignored in favour of this. |
+| `ANYDOC_OCR_CALLS_PER_MINUTE` | free 20, paid 300 | One limiter shared by all workers spaces every request (submit, poll, retry). |
+| `ANYDOC_OCR_PAGE_TIMEOUT_SECONDS` | 120 | Wall-clock limit per page, retries and waits included. Past it the page fails with an `OcrError` that names the rate limit when that was the cause, and no further request is sent for it. |
+
+Explicit poll and calls-per-minute values always beat the tier's profile. A 429 makes anydoc wait the `Retry-After` Azure names (at most 30 s) and retry the same request up to 4 times. While it waits, `on_progress` gets an `OcrProgress` with `rate_limited_s` set to the wait in seconds (`None` otherwise) and the current `pages_done`, `eta_s` and so on, still on the calling thread.
+
+```bash
+ANYDOC_AZURE_TIER=free ANYDOC_OCR_MAX_WORKERS=2 python convert.py scan.pdf
+```
+
 ## Features
 
 - **One output for every format.** Each format parses into a shared document model and renders through a single Markdown serializer, so escaping, tables, heading anchors, and footnotes behave identically whether the input was a `.doc` from 2003 or a `.pptx` from yesterday.

@@ -3,12 +3,14 @@
 import json
 import logging
 import os
+import queue
 import time
 import urllib.error
 import urllib.request
 import uuid
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from dataclasses import replace
 from importlib.metadata import PackageNotFoundError, version
 from io import BytesIO
 from pathlib import Path
@@ -261,6 +263,10 @@ _log = logging.getLogger(__name__)
 # entirely, and `int("")` raises. Empty is treated the same as unset.
 _MAX_WORKERS = int(os.environ.get("ANYDOC_OCR_MAX_WORKERS") or "8")
 
+# How often the calling thread looks up from waiting on pages to pass on
+# rate-limit notices from the workers.
+_NOTICE_POLL_SECONDS = 0.25
+
 
 # `data` is guaranteed to be PDF bytes here, not just assumed: NeedsOcr is
 # raised in exactly one place in the whole Rust core, src/formats/pdf.rs --
@@ -321,22 +327,43 @@ def _parse_ocr(
         markdown = client.ocr_page(page_bytes)
         return markdown, time.monotonic() - started
 
+    # Workers never call `on_progress`. A client that gets told to wait by its
+    # service (see `ocr_clients.base`) drops the wait on this queue instead.
+    notices: "queue.SimpleQueue[float]" = queue.SimpleQueue()
+    subscribe = getattr(client, "set_rate_limit_notifier", None)
+    if subscribe:
+        subscribe(notices.put)
+
     report = on_progress if pages_needing_ocr else None
     if report:
         _notify(report, tracker.progress())
 
     # Workers only OCR. Every callback fires here, on the calling thread, as
-    # futures complete, so consumers never need a lock. The first failed page
-    # raises out of the loop and no further event is emitted.
+    # futures complete (or a rate-limit notice arrives), so consumers never
+    # need a lock. The first failed page raises out of the loop and no
+    # further event is emitted.
     by_page: "dict[int, str]" = {}
     try:
         with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:
-            futures = {pool.submit(_dispatch, page_num): page_num for page_num in pages_needing_ocr}
-            for future in as_completed(futures):
-                by_page[futures[future]], seconds = future.result()
-                tracker.page_done(futures[future], seconds)
-                if report:
-                    _notify(report, tracker.progress())
+            pending = {pool.submit(_dispatch, page_num): page_num for page_num in pages_needing_ocr}
+            try:
+                while pending:
+                    done, _ = wait(pending, timeout=_NOTICE_POLL_SECONDS, return_when=FIRST_COMPLETED)
+                    while not notices.empty():
+                        waiting_s = notices.get()
+                        if report:
+                            _notify(report, replace(tracker.progress(), rate_limited_s=waiting_s))
+                    for future in sorted(done, key=pending.__getitem__):  # page order: the first failure wins
+                        page_num = pending.pop(future)
+                        by_page[page_num], seconds = future.result()
+                        tracker.page_done(page_num, seconds)
+                        if report:
+                            _notify(report, tracker.progress())
+            finally:
+                # On failure, don't let the pool run the pages still queued
+                # (each could wait out its own timeout) before the error shows.
+                for future in pending:
+                    future.cancel()
     except Exception as exc:
         raise OcrError(f"{engine_name}: {exc}") from exc
     results = [by_page[page_num] for page_num in pages_needing_ocr]
