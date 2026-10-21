@@ -143,7 +143,9 @@ def to_markdown_bytes(
         engine = _ocr_requested()
         if engine is None:
             raise
-        return _parse_ocr(bytes(data), _route(bytes(data), error.pages), engine, on_progress=on_progress)
+        return _parse_ocr(
+            bytes(data), _route(bytes(data), error.pages), engine, on_progress=on_progress
+        )
     # A document that converted without raising can still have lost text: the
     # core's check only fires when a page yields nothing at all, and a page
     # whose glyphs were converted to outlines renders perfectly and extracts
@@ -242,6 +244,9 @@ def _route(data: bytes, already_flagged: "list[int]") -> "list[int]":
     return sorted(set(already_flagged) | set(_health_pages(data)))
 
 
+_log = logging.getLogger(__name__)
+
+
 # Overridable per deployment: 8 assumes headroom the OCR engine's own tier/quota
 # actually has. A low-tier resource (e.g. Azure Document Intelligence's free F0,
 # 20 calls/minute) hits 429 well before 8 concurrent per-page jobs finish on any
@@ -254,7 +259,6 @@ def _route(data: bytes, already_flagged: "list[int]") -> "list[int]":
 # `${ANYDOC_OCR_MAX_WORKERS:-}` default) gets the var present but empty, not
 # absent -- os.environ.get's own default only fires when the key is missing
 # entirely, and `int("")` raises. Empty is treated the same as unset.
-_log = logging.getLogger(__name__)
 _MAX_WORKERS = int(os.environ.get("ANYDOC_OCR_MAX_WORKERS") or "8")
 
 
@@ -306,6 +310,9 @@ def _parse_ocr(
     pages = pdf_inspector.extract_pages_markdown_bytes(data).pages
     merged = [page.markdown for page in pages]
 
+    engine_name = engine.__name__.rsplit(".", 1)[-1]
+    tracker = EtaTracker(engine_name, len(pages_needing_ocr), _MAX_WORKERS)
+
     def _dispatch(page_num: int) -> "tuple[str, float]":
         started = time.monotonic()
         tracker.page_started(page_num)
@@ -314,8 +321,6 @@ def _parse_ocr(
         markdown = client.ocr_page(page_bytes)
         return markdown, time.monotonic() - started
 
-    engine_name = engine.__name__.rsplit(".", 1)[-1]
-    tracker = EtaTracker(engine_name, len(pages_needing_ocr), _MAX_WORKERS)
     report = on_progress if pages_needing_ocr else None
     if report:
         _notify(report, tracker.progress())

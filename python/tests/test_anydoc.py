@@ -844,10 +844,6 @@ class PageHealthTest(unittest.TestCase):
             self.assertIsInstance(page.cmap_corruption_ratio, float)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 def _simulate_eta(durations: list[float], workers: int) -> list[SimpleNamespace]:
     """Plays `durations` (seconds per page, in dispatch order) through an
     `EtaTracker` on a virtual clock, with `workers` threads each taking the
@@ -1115,3 +1111,7 @@ class OcrProgressTest(unittest.TestCase):
         for page in (4, 5, 6):
             tracker.page_done(page, 1.0)
         self.assertEqual(tracker.progress().eta_s, 0.0)
+
+
+if __name__ == "__main__":
+    unittest.main()
