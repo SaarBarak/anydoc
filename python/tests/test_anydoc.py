@@ -1113,5 +1113,342 @@ class OcrProgressTest(unittest.TestCase):
         self.assertEqual(tracker.progress().eta_s, 0.0)
 
 
+class _FakeTime:
+    """A virtual clock. `sleep` advances it, so a test never waits. Used from
+    one active thread at a time (a worker blocks while its poller runs)."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.t = 1000.0
+        self.sleeps = []  # what anydoc itself slept (limiter, 429 waits)
+        self.transport_sleeps = []  # what the SDK's poller slept
+
+    def now(self):
+        return self.t
+
+    def sleep(self, seconds):
+        with self._lock:
+            self.sleeps.append(seconds)
+            self.t += seconds
+
+    def transport_sleep(self, seconds):
+        with self._lock:
+            self.transport_sleeps.append(seconds)
+            self.t += seconds
+
+
+class _FakeRaw(io.BytesIO):
+    enforce_content_length = False
+
+
+class _FakeAzureService:
+    """A canned Azure Document Intelligence behind a fake HTTP session, so the
+    real SDK client, poller and pipeline run. `polls_to_finish` polls answer
+    "running" before "succeeded". `limit(request_no, now)` may return a
+    Retry-After to answer 429 instead. Every request is recorded with the
+    virtual time it arrived."""
+
+    def __init__(self, clock, polls_to_finish=2, limit=None, poll_retry_after="1", message="call rate limit exceeded"):
+        self.clock = clock
+        self.message = message
+        self.polls_to_finish = polls_to_finish
+        self.limit = limit or (lambda request_no, now: None)
+        self.poll_retry_after = poll_retry_after
+        self.requests = []  # (virtual time, method)
+        self._lock = threading.Lock()
+        self._ops = {}  # operation id -> [page, polls left]
+
+    def request(self, method, url, headers=None, data=None, **kwargs):
+        import base64
+        import requests
+
+        with self._lock:
+            self.requests.append((self.clock.now(), method))
+            retry_after = self.limit(len(self.requests), self.clock.now())
+            response = requests.Response()
+            response.url = url
+            if retry_after is not None:
+                response.status_code = 429
+                response.headers["Retry-After"] = str(retry_after)
+                body = json.dumps({"error": {"code": "429", "message": self.message}}).encode()
+            elif method == "POST":
+                page = _page_number_of(base64.b64decode(json.loads(data)["base64Source"]))
+                op = f"op{len(self._ops)}"
+                self._ops[op] = [page, self.polls_to_finish]
+                response.status_code = 202
+                response.headers["Operation-Location"] = (
+                    f"https://example.cognitiveservices.azure.com/documentintelligence/documentModels/"
+                    f"prebuilt-layout/analyzeResults/{op}?api-version=2024-11-30"
+                )
+                body = b""
+            else:
+                op = url.split("/analyzeResults/")[1].split("?")[0]
+                state = self._ops[op]
+                response.status_code = 200
+                response.headers["Retry-After"] = self.poll_retry_after
+                if state[1] > 0:
+                    state[1] -= 1
+                    body = {"status": "running"}
+                else:
+                    body = {
+                        "status": "succeeded",
+                        "analyzeResult": {
+                            "apiVersion": "2024-11-30",
+                            "modelId": "prebuilt-layout",
+                            "stringIndexType": "textElements",
+                            "content": f"OCR-{state[0]}\n",
+                            "pages": [],
+                        },
+                    }
+                body = json.dumps(body).encode()
+            response.headers["Content-Type"] = "application/json"
+            response.raw = _FakeRaw(body)  # the transport reads the body from it
+            return response
+
+    def close(self):
+        pass
+
+
+def _fake_azure_engine(service, clock, settings):
+    """An engine module whose `client()` builds the real `AzureDiClient` over
+    the fake service. `settings` are the ANYDOC_OCR_* variables to set."""
+    import types
+
+    from azure.core.pipeline.transport import RequestsTransport
+
+    from anydoc.ocr_clients import azure_di
+
+    class _Transport(RequestsTransport):
+        def sleep(self, duration):
+            clock.transport_sleep(duration)
+
+    def build():
+        with patch.dict(os.environ, settings):
+            return azure_di.AzureDiClient.from_env(
+                transport=_Transport(session=service),
+                clock=clock.now,
+                sleep=clock.sleep,
+            )
+
+    engine = types.ModuleType("azure_di")
+    engine.client = build
+    return engine
+
+
+@unittest.skipUnless(_PDF_LIBS_INSTALLED, "pdf-inspector/pypdf not installed")
+@unittest.skipUnless(_AZURE_EXTRA_INSTALLED, "azure extra not installed")
+class AzureRateLimitTest(unittest.TestCase):
+    """The real Azure SDK client, poller and pipeline over a fake HTTP session
+    and a virtual clock: no network, no real waiting."""
+
+    FAR = {"ANYDOC_OCR_PAGE_TIMEOUT_SECONDS": "100000"}
+
+    def _run(self, pages, service, clock, settings=None, workers=1, **kwargs):
+        engine = _fake_azure_engine(service, clock, {**self.FAR, **(settings or {})})
+        with patch.object(anydoc, "_MAX_WORKERS", workers), azure_env():
+            return anydoc._parse_ocr(
+                _numbered_pdf(pages), list(range(1, pages + 1)), engine=engine, **kwargs
+            )
+
+    def test_the_poll_interval_is_the_setting_not_the_services_retry_after(self):
+        for setting, expected in ((None, 4.0), ("7", 7.0)):
+            clock = _FakeTime()
+            service = _FakeAzureService(clock, polls_to_finish=3, poll_retry_after="1")
+            settings = {"ANYDOC_AZURE_TIER": "free"}  # the free profile polls every 4 s
+            if setting:
+                settings["ANYDOC_OCR_POLL_SECONDS"] = setting
+            result = self._run(1, service, clock, settings)
+            self.assertEqual(result, "OCR-1\n")
+            self.assertEqual(clock.transport_sleeps, [expected] * 3, f"setting={setting}")
+
+    def test_the_limiter_spaces_submits_and_polls_across_workers(self):
+        clock = _FakeTime()
+        clock.now = lambda: 1000.0  # frozen: every acquire reserves the next slot from the same instant
+        service = _FakeAzureService(clock, polls_to_finish=2)
+        self._run(6, service, clock, {"ANYDOC_OCR_CALLS_PER_MINUTE": "20"}, workers=3)
+        # 6 submits + 6 * 3 polls = 24 requests, so 23 reserved waits, 3 s apart:
+        # 20 calls a minute whatever the worker count, in any thread order.
+        self.assertEqual(len(service.requests), 24)
+        self.assertEqual(sorted(clock.sleeps), [3.0 * n for n in range(1, 24)])
+
+    def test_more_pages_than_one_minutes_limit_all_get_read(self):
+        clock = _FakeTime()
+
+        def limit(request_no, now):  # the service: 20 calls in any 60 s, else 429
+            recent = [t for t, _ in service.requests[:-1] if now - t < 60.0]
+            return 1 if len(recent) >= 20 else None
+
+        service = _FakeAzureService(clock, polls_to_finish=1, limit=limit)
+        result = self._run(15, service, clock, {"ANYDOC_OCR_CALLS_PER_MINUTE": "20"})
+        self.assertEqual(result, "\n\n".join(f"OCR-{n}\n" for n in range(1, 16)))
+        self.assertGreater(len(service.requests), 20)  # more than a minute's worth was sent
+
+    def test_without_the_limiter_the_same_run_fails_on_429(self):
+        clock = _FakeTime()
+
+        def limit(request_no, now):
+            recent = [t for t, _ in service.requests[:-1] if now - t < 60.0]
+            return 1 if len(recent) >= 20 else None
+
+        service = _FakeAzureService(clock, polls_to_finish=1, limit=limit)
+        with self.assertRaisesRegex(anydoc.OcrError, r"429 \(rate limit\)"):
+            self._run(15, service, clock, {"ANYDOC_OCR_CALLS_PER_MINUTE": "100000"})
+
+    def test_a_429_waits_the_named_time_retries_and_announces_on_the_calling_thread(self):
+        clock = _FakeTime()
+        service = _FakeAzureService(clock, polls_to_finish=1, limit=lambda n, now: 9 if n == 2 else None)
+        events, threads = [], set()
+
+        def record(event):
+            threads.add(threading.get_ident())
+            events.append(event)
+
+        result = self._run(2, service, clock, {"ANYDOC_OCR_CALLS_PER_MINUTE": "100000"}, on_progress=record)
+        self.assertEqual(result, "OCR-1\n\n\nOCR-2\n")
+        self.assertIn(9.0, clock.sleeps)  # waited what Retry-After named
+        noticed = [e for e in events if e.rate_limited_s is not None]
+        self.assertEqual([e.rate_limited_s for e in noticed], [9.0])
+        self.assertEqual((noticed[0].pages_total, noticed[0].pages_done), (2, 0))
+        self.assertEqual(threads, {threading.get_ident()})
+        self.assertEqual(events[-1].eta_s, 0.0)
+        self.assertIsNone(events[-1].rate_limited_s)
+
+    def test_a_retry_after_is_capped(self):
+        clock = _FakeTime()
+        service = _FakeAzureService(clock, polls_to_finish=1, limit=lambda n, now: 3600 if n == 1 else None)
+        self._run(1, service, clock, {"ANYDOC_OCR_CALLS_PER_MINUTE": "100000"})
+        self.assertIn(30.0, clock.sleeps)
+        self.assertNotIn(3600.0, clock.sleeps)
+
+    def test_a_page_stuck_on_429_fails_naming_the_rate_limit_and_sends_nothing_after(self):
+        clock = _FakeTime()
+        service = _FakeAzureService(clock, limit=lambda n, now: 10)
+        settings = {"ANYDOC_OCR_PAGE_TIMEOUT_SECONDS": "25", "ANYDOC_OCR_CALLS_PER_MINUTE": "100000"}
+        engine = _fake_azure_engine(service, clock, settings)
+        with azure_env():
+            with self.assertRaisesRegex(anydoc.OcrError, r"azure_di: page did not finish within 25 s; .*429 \(rate limit\)"):
+                anydoc._parse_ocr(_numbered_pdf(1), [1], engine=engine)
+        sent = len(service.requests)
+        self.assertEqual(sent, 3)  # t=0, 10, 20; the next wait (to 30) would pass the 25 s limit
+        self.assertLessEqual(clock.t - 1000.0, 25.0)
+        time.sleep(0.2)
+        self.assertEqual(len(service.requests), sent)
+
+    def test_a_poll_loop_past_the_deadline_stops_and_leaves_no_polling_thread(self):
+        clock = _FakeTime()
+        service = _FakeAzureService(clock, polls_to_finish=10**6)  # never finishes
+        engine = _fake_azure_engine(
+            service, clock, {"ANYDOC_OCR_PAGE_TIMEOUT_SECONDS": "30", "ANYDOC_OCR_CALLS_PER_MINUTE": "100000"}
+        )
+        with azure_env(), self.assertRaisesRegex(anydoc.OcrError, "page did not finish within 30 s$"):
+            anydoc._parse_ocr(_numbered_pdf(1), [1], engine=engine)
+        sent = len(service.requests)
+        time.sleep(0.2)
+        self.assertEqual(len(service.requests), sent, "a request was sent after the timeout")
+        self.assertEqual([t for t in threading.enumerate() if t.name.startswith("LROPoller")], [])
+
+    def test_429_that_never_clears_stops_after_the_bounded_retries_with_the_service_message(self):
+        from anydoc.ocr_clients import azure_di
+
+        clock = _FakeTime()
+        service = _FakeAzureService(clock, limit=lambda n, now: 1)
+        settings = {"ANYDOC_OCR_CALLS_PER_MINUTE": "100000"}
+        engine = _fake_azure_engine(service, clock, {**self.FAR, **settings})
+        with azure_env(), self.assertRaisesRegex(anydoc.OcrError, "call rate limit exceeded"):
+            anydoc._parse_ocr(_numbered_pdf(1), [1], engine=engine)
+        self.assertEqual(len(service.requests), azure_di.MAX_RATE_LIMIT_RETRIES + 1)
+
+    def test_settings_are_read_from_the_environment_and_empty_means_unset(self):
+        from anydoc.ocr_clients import azure_di
+
+        with patch.dict(os.environ, {"ANYDOC_OCR_POLL_SECONDS": "", "ANYDOC_OCR_CALLS_PER_MINUTE": " "}):
+            os.environ.pop("ANYDOC_OCR_PAGE_TIMEOUT_SECONDS", None)
+            self.assertEqual(azure_di._setting(azure_di.POLL_SECONDS_ENV, 4.0), 4.0)
+            self.assertEqual(azure_di._setting(azure_di.CALLS_PER_MINUTE_ENV, 20.0), 20.0)
+            self.assertEqual(azure_di._setting(azure_di.PAGE_TIMEOUT_SECONDS_ENV, 120.0), 120.0)
+        with patch.dict(os.environ, {"ANYDOC_OCR_POLL_SECONDS": "2.5"}):
+            self.assertEqual(azure_di._setting(azure_di.POLL_SECONDS_ENV, 4.0), 2.5)
+        for bad in ("abc", "0", "-3"):
+            with patch.dict(os.environ, {"ANYDOC_OCR_POLL_SECONDS": bad}):
+                with self.assertRaises(azure_di.ClientConfigError):
+                    azure_di._setting(azure_di.POLL_SECONDS_ENV, 4.0)
+
+    def test_defaults_are_the_named_constants(self):
+        from anydoc.ocr_clients import azure_di
+
+        self.assertEqual((azure_di.FREE_PROFILE.poll_seconds, azure_di.FREE_PROFILE.calls_per_minute), (4.0, 20.0))
+        self.assertEqual((azure_di.PAID_PROFILE.poll_seconds, azure_di.PAID_PROFILE.calls_per_minute), (1.0, 300.0))
+        self.assertEqual(azure_di.DEFAULT_PAGE_TIMEOUT_SECONDS, 120.0)
+
+    def _client_with(self, **settings):
+        from anydoc.ocr_clients import azure_di
+
+        clock = _FakeTime()
+        with azure_env(), patch.dict(os.environ, settings):
+            return azure_di.AzureDiClient.from_env(clock=clock.now, sleep=clock.sleep)
+
+    def test_a_bad_tier_names_the_allowed_values(self):
+        with self.assertRaisesRegex(Exception, "ANYDOC_AZURE_TIER must be one of auto, free, paid"):
+            self._client_with(ANYDOC_AZURE_TIER="premium")
+
+    def test_free_warns_once_at_construction_paid_and_auto_do_not(self):
+        with self.assertLogs("anydoc.ocr_clients.azure_di", "WARNING") as logs:
+            self._client_with(ANYDOC_AZURE_TIER="free")
+        self.assertEqual(len(logs.records), 1)
+        self.assertIn("20 calls a minute", logs.output[0])
+        for tier in ("paid", "auto", ""):
+            with self.assertNoLogs("anydoc.ocr_clients.azure_di", "WARNING"):
+                self._client_with(ANYDOC_AZURE_TIER=tier)
+
+    def test_explicit_rate_settings_beat_the_profile(self):
+        client = self._client_with(ANYDOC_AZURE_TIER="free", ANYDOC_OCR_POLL_SECONDS="2", ANYDOC_OCR_CALLS_PER_MINUTE="60")
+        self.assertEqual((client._poll_seconds, client._limiter._interval), (2.0, 1.0))
+
+    def test_auto_starts_fast_then_a_429_naming_f0_switches_to_the_free_rate_once(self):
+        clock = _FakeTime()
+        message = "exceeded call rate limit of your current FormRecognizer F0 pricing tier. Please retry after 1 second."
+        service = _FakeAzureService(clock, polls_to_finish=1, message=message, limit=lambda n, now: 1 if n == 3 else None)
+        with self.assertLogs("anydoc.ocr_clients.azure_di", "WARNING") as logs:
+            result = self._run(4, service, clock, {"ANYDOC_AZURE_TIER": "auto"})
+        self.assertEqual(result, "\n\n".join(f"OCR-{n}\n" for n in range(1, 5)))
+        self.assertEqual(len(logs.records), 1)
+        self.assertIn("detected from the service's own 429", logs.output[0])
+        times = [t for t, _ in service.requests]
+        before = [times[1] - times[0]]  # submit, then its first poll
+        after = [b - a for a, b in zip(times[3:], times[4:])]
+        self.assertTrue(all(gap < 1.0 for gap in before), before)  # paid start: 300 calls a minute
+        self.assertTrue(after and all(gap >= 3.0 for gap in after), after)  # then 20 a minute
+
+    def test_a_429_that_does_not_name_the_free_tier_does_not_switch(self):
+        clock = _FakeTime()
+        service = _FakeAzureService(clock, polls_to_finish=1, limit=lambda n, now: 1 if n == 2 else None)
+        with self.assertNoLogs("anydoc.ocr_clients.azure_di", "WARNING"):
+            self._run(3, service, clock, {"ANYDOC_AZURE_TIER": "auto"})
+        times = [t for t, _ in service.requests]
+        self.assertTrue(all(b - a < 3.0 for a, b in zip(times[3:], times[4:])))
+
+    def test_paid_never_switches_even_if_a_429_names_f0(self):
+        clock = _FakeTime()
+        service = _FakeAzureService(
+            clock, polls_to_finish=1, message="FormRecognizer F0 pricing tier", limit=lambda n, now: 1 if n == 2 else None
+        )
+        with self.assertNoLogs("anydoc.ocr_clients.azure_di", "WARNING"):
+            self._run(3, service, clock, {"ANYDOC_AZURE_TIER": "paid"})
+
+    def test_a_client_without_the_notifier_hook_still_works(self):
+        events = []
+        with azure_env(), azure_stub(lambda b: "ok\n"):
+            anydoc._parse_ocr(_blank_pdf(2), [1, 2], on_progress=events.append)
+        self.assertTrue(all(e.rate_limited_s is None for e in events))
+
+    def test_output_matches_the_plain_stub_when_no_limit_triggers(self):
+        clock = _FakeTime()
+        service = _FakeAzureService(clock)
+        real = self._run(4, service, clock)
+        with azure_env(), azure_stub(lambda b: f"OCR-{_page_number_of(b)}\n"):
+            stub = anydoc._parse_ocr(_numbered_pdf(4), [1, 2, 3, 4])
+        self.assertEqual(real, stub)
+
+
 if __name__ == "__main__":
     unittest.main()

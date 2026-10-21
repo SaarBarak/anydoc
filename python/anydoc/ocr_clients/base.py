@@ -13,6 +13,12 @@ class OcrClient(Protocol):
         ...
 
 
+# Optional, not part of `OcrClient`: a client that can be told to wait by its
+# service may also have `set_rate_limit_notifier(notify: Callable[[float], None])`
+# and call `notify(seconds)` (from any thread) before each such wait.
+# `_parse_ocr` uses it when present and ignores clients without it.
+
+
 class ClientConfigError(Exception):
     """A client's required configuration (env vars, credentials, or its own
     optional dependency) is missing or incomplete. Engine-agnostic --

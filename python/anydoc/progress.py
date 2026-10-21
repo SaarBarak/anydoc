@@ -13,7 +13,9 @@ class OcrProgress:
     """One progress event from `_parse_ocr`. `pages_total` counts the pages
     routed to OCR, not the pages in the document, so a 3-page OCR job in a
     95-page PDF reports 3, not 95. `eta_s` is an estimate, and `None` until
-    the first page has completed."""
+    the first page has completed. `rate_limited_s` is `None` except on an
+    event sent because the OCR service said to wait: then it is how many
+    seconds the run is waiting, and the other fields are the current state."""
 
     stage: Literal["ocr"]
     engine: str
@@ -21,6 +23,7 @@ class OcrProgress:
     pages_total: int
     elapsed_s: float
     eta_s: "float | None"
+    rate_limited_s: "float | None" = None
 
 
 class EtaTracker:
