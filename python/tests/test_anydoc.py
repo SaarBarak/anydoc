@@ -5,6 +5,7 @@ import io
 import json
 import os
 import re
+import sys
 import threading
 import time
 import unittest
@@ -402,7 +403,7 @@ class AnydocTest(unittest.TestCase):
         exported = {name for name in dir(anydoc._anydoc) if not name.startswith("_")}
         self.assertEqual(stubbed, exported)
         # __init__.py re-exports the whole module, plus what it adds itself.
-        self.assertEqual(set(anydoc.__all__), exported | {"Format", "HostedError", "OcrError", "Ocr"})
+        self.assertEqual(set(anydoc.__all__), exported | {"Format", "HostedError", "OcrError", "Ocr", "OcrProgress"})
 
 
 @unittest.skipUnless(_AZURE_EXTRA_INSTALLED, "azure extra not installed")
@@ -841,6 +842,275 @@ class PageHealthTest(unittest.TestCase):
             self.assertEqual(page.page, number)  # 1-indexed, matching NeedsOcrError
             self.assertIsInstance(page.curve_ops, int)
             self.assertIsInstance(page.cmap_corruption_ratio, float)
+
+
+def _simulate_eta(durations: list[float], workers: int) -> list[SimpleNamespace]:
+    """Plays `durations` (seconds per page, in dispatch order) through an
+    `EtaTracker` on a virtual clock, with `workers` threads each taking the
+    next page the moment they free up -- what `ThreadPoolExecutor` does.
+    Returns one record per event with `done`, `remaining`, `eta` and the true
+    `actual` time left, so tests can apply whichever accuracy rule they like."""
+    from anydoc.progress import EtaTracker
+
+    free_at = [0.0] * workers
+    pages = []  # (start, finish, index)
+    for index, duration in enumerate(durations):
+        slot = min(range(workers), key=free_at.__getitem__)
+        pages.append((free_at[slot], free_at[slot] + duration, index))
+        free_at[slot] += duration
+    end = max(finish for _, finish, _ in pages)
+
+    now = [0.0]
+    tracker = EtaTracker("sim", len(durations), workers, clock=lambda: now[0])
+    unstarted = sorted(pages)
+    events = []
+    for _, finished_at, index in sorted(pages, key=lambda page: (page[1], page[2])):
+        while unstarted and unstarted[0][0] <= finished_at:  # workers log starts as they happen
+            start, _, page = unstarted.pop(0)
+            now[0] = start
+            tracker.page_started(page)
+        now[0] = finished_at
+        tracker.page_done(index, durations[index])
+        event = tracker.progress()
+        events.append(SimpleNamespace(
+            done=event.pages_done, remaining=len(durations) - event.pages_done,
+            eta=event.eta_s, actual=end - finished_at,
+        ))
+    return events
+
+
+class OcrProgressTest(unittest.TestCase):
+    """`on_progress`: engine-agnostic, driven from `_parse_ocr`'s calling
+    thread. All engine clients are mocked; no network."""
+
+    PAGES = 12
+
+    def _run(self, **kwargs):
+        events = []
+        with azure_env(), azure_stub(lambda page_bytes: f"OCR-{_page_number_of(page_bytes)}\n"):
+            result = anydoc._parse_ocr(
+                _numbered_pdf(self.PAGES), list(range(1, self.PAGES + 1)), on_progress=events.append, **kwargs
+            )
+        return result, events
+
+    def test_events_start_at_zero_and_count_up_to_the_routed_page_count(self):
+        _, events = self._run()
+        self.assertEqual([e.pages_done for e in events], list(range(self.PAGES + 1)))
+        for event in events:
+            self.assertEqual((event.stage, event.engine, event.pages_total), ("ocr", "azure_di", self.PAGES))
+        self.assertEqual([e.elapsed_s for e in events], sorted(e.elapsed_s for e in events))
+
+    def test_eta_is_none_until_a_page_completes_then_non_negative(self):
+        _, events = self._run()
+        self.assertIsNone(events[0].eta_s)
+        for event in events[1:]:
+            self.assertGreaterEqual(event.eta_s, 0)
+        self.assertEqual(events[-1].eta_s, 0)
+
+    def test_pages_total_is_the_routed_count_not_the_document_length(self):
+        events = []
+        with azure_env(), azure_stub(lambda page_bytes: "ok\n"):
+            anydoc._parse_ocr(_blank_pdf(10), [2, 5], on_progress=events.append)
+        self.assertEqual([(e.pages_done, e.pages_total) for e in events], [(0, 2), (1, 2), (2, 2)])
+
+    def test_every_callback_runs_on_the_calling_thread_with_eight_workers(self):
+        threads = set()
+        with patch.object(anydoc, "_MAX_WORKERS", 8), azure_env(), azure_stub(lambda b: "ok\n"):
+            anydoc._parse_ocr(
+                _blank_pdf(24), list(range(1, 25)), on_progress=lambda e: threads.add(threading.get_ident())
+            )
+        self.assertEqual(threads, {threading.get_ident()})
+
+    def test_a_raising_callback_is_logged_and_does_not_change_the_output(self):
+        plain, _ = self._run()
+
+        def explode(event):
+            raise RuntimeError("callback bug")
+
+        with azure_env(), azure_stub(lambda b: f"OCR-{_page_number_of(b)}\n"):
+            with self.assertLogs("anydoc", "ERROR") as logs:
+                result = anydoc._parse_ocr(
+                    _numbered_pdf(self.PAGES), list(range(1, self.PAGES + 1)), on_progress=explode
+                )
+        self.assertEqual(result, plain)
+        self.assertEqual(len(logs.records), self.PAGES + 1)  # one per event, none fatal
+
+    def test_output_is_identical_with_and_without_a_callback(self):
+        with_callback, _ = self._run()
+        with azure_env(), azure_stub(lambda b: f"OCR-{_page_number_of(b)}\n"):
+            without = anydoc._parse_ocr(_numbered_pdf(self.PAGES), list(range(1, self.PAGES + 1)))
+        self.assertEqual(with_callback, without)
+
+    def test_a_failing_page_raises_ocr_error_and_no_event_follows(self):
+        events = []
+
+        def fail_on_three(page_bytes):
+            if _page_number_of(page_bytes) == 3:
+                raise RuntimeError("page 3 broke")
+            return "ok\n"
+
+        with patch.object(anydoc, "_MAX_WORKERS", 1), azure_env(), azure_stub(fail_on_three):
+            with self.assertRaisesRegex(anydoc.OcrError, "azure_di: page 3 broke"):
+                anydoc._parse_ocr(_numbered_pdf(6), [1, 2, 3, 4, 5, 6], on_progress=events.append)
+        self.assertEqual([e.pages_done for e in events], [0, 1, 2])
+
+    def test_no_pages_to_ocr_emits_nothing(self):
+        events = []
+        with azure_env():
+            anydoc._parse_ocr(MIXED.read_bytes(), [], on_progress=events.append)
+        self.assertEqual(events, [])
+
+    def test_azure_reports_through_both_public_functions(self):
+        data = MIXED.read_bytes()
+        for call in (anydoc.to_markdown_bytes, lambda d, **kw: anydoc.to_markdown(MIXED, **kw)):
+            with azure_env(), azure_stub(lambda b: "OCR\n"):
+                events = []
+                call(data, on_progress=events.append)
+                self.assertEqual(
+                    [(e.engine, e.pages_done, e.pages_total) for e in events],
+                    [("azure_di", 0, 1), ("azure_di", 1, 1)],
+                )
+
+    def test_hosted_reports_nothing(self):
+        reply = {"success": True, "data": {"markdown": HOSTED_MARKDOWN}}
+        events = []
+        with azure_env(), hosted_stub(200, reply):
+            anydoc.to_markdown(MIXED, ocr="hosted", on_progress=events.append)
+        self.assertEqual(events, [])
+
+    def test_eta_is_accurate_on_steady_pages(self):
+        self._assert_eta_accuracy([1.0] * 96, "steady")
+
+    def test_eta_is_accurate_on_noisy_pages(self):
+        import random
+
+        for seed in range(20):
+            rng = random.Random(seed)
+            self._assert_eta_accuracy([rng.uniform(0.85, 1.15) for _ in range(96)], f"noisy seed {seed}")
+
+    def _assert_eta_accuracy(self, durations, label, workers=8):
+        """R10, counted only from 3 pages and 20% done onward:
+        - at least 4 * workers pages remaining: within 10% of the true time left;
+        - fewer than `workers` remaining (the tail): within half a mean page,
+          absolute, since the time left is a fraction of one page and a ratio
+          is meaningless there. The final event is exact by construction;
+        - between the two, NOTHING is asserted. There the time left is a page
+          or two, set by the slowest of the last few random pages, which a
+          mean cannot predict to 10% (measured up to 23% on noisy pages)."""
+        mean = sum(durations) / len(durations)
+        for event in _simulate_eta(durations, workers):
+            if event.done < 3 or event.done < 0.2 * len(durations) or event.remaining == 0:
+                continue
+            error = abs(event.eta - event.actual)
+            if event.remaining >= 4 * workers:
+                self.assertLessEqual(error / event.actual, 0.10, f"{label}: {event.done} done")
+            elif event.remaining < workers:
+                self.assertLessEqual(error, 0.5 * mean, f"{label}: {event.done} done, tail")
+
+    def test_the_tracker_survives_concurrent_workers_and_snapshots(self):
+        """Workers start and finish pages as fast as they can while this
+        thread keeps taking snapshots, until it has taken thousands. The
+        tracker must not raise, `pages_done` must only grow and never pass
+        what was begun, and the final count must equal the work done."""
+        from anydoc.progress import EtaTracker
+
+        workers, snapshots_wanted = 16, 3000
+        tracker = EtaTracker("stress", 2 * workers, workers)  # small, so the replay stays cheap; workers outrun it
+        go, stop = threading.Event(), threading.Event()
+        errors, begun = [], [0] * workers
+
+        def work(slot):
+            go.wait()
+            try:
+                while not stop.is_set():
+                    page = slot * 1_000_000 + begun[slot]
+                    begun[slot] += 1  # counted before the tracker sees it, so it never lags
+                    tracker.page_started(page)
+                    tracker.page_done(page, 0.001)
+            except Exception as exc:  # surfaced below, not lost in a thread
+                errors.append(exc)
+
+        threads = [threading.Thread(target=work, args=(slot,)) for slot in range(workers)]
+        for thread in threads:
+            thread.start()
+        switch_interval = sys.getswitchinterval()
+        sys.setswitchinterval(1e-6)  # interleave as finely as CPython allows
+        self.addCleanup(sys.setswitchinterval, switch_interval)
+        go.set()
+        last_done = 0
+        try:
+            for _ in range(snapshots_wanted):
+                event = tracker.progress()  # raises if the shared state tears
+                self.assertGreaterEqual(event.pages_done, last_done)
+                self.assertLessEqual(event.pages_done, sum(begun))
+                if event.eta_s is not None:
+                    self.assertGreaterEqual(event.eta_s, 0)
+                last_done = event.pages_done
+        finally:
+            stop.set()
+            for thread in threads:
+                thread.join()
+        self.assertEqual(errors, [])
+        self.assertEqual(tracker.progress().pages_done, sum(begun))
+
+    def test_the_queue_arithmetic_matches_replaying_every_page(self):
+        import heapq
+        import random
+        from anydoc.progress import EtaTracker
+
+        rng = random.Random(359)
+        for _ in range(300):
+            workers, mean = rng.randint(1, 8), rng.uniform(0.5, 2.0)
+            running = rng.randint(0, workers)
+            queued = rng.randint(0, 60)
+            now = [100.0]
+            tracker = EtaTracker("sim", 1000, workers, clock=lambda: now[0])
+            tracker.page_done(0, mean)
+            starts = [100.0 - rng.uniform(0, 1.5) * mean for _ in range(running)]
+            for page, start in enumerate(starts, 1):
+                now[0] = start
+                tracker.page_started(page)
+            now[0] = 100.0
+            tracker._total = 1 + running + queued
+            free = [max(s + mean, 100.0 + 0.1 * mean) for s in starts] + [100.0] * (workers - running)
+            heapq.heapify(free)
+            for _ in range(queued):
+                heapq.heappush(free, heapq.heappop(free) + mean)
+            self.assertAlmostEqual(tracker.progress().eta_s, max(free) - 100.0)
+
+    def test_a_nonsense_page_total_cannot_hang_the_estimate(self):
+        from anydoc.progress import EtaTracker
+
+        for total in (1, 10**12):  # fewer than done, and absurdly many
+            tracker = EtaTracker("sim", total, 8)
+            for page in range(5):
+                tracker.page_started(page)
+                tracker.page_done(page, 1.0)
+            t0 = time.monotonic()
+            event = tracker.progress()
+            self.assertLess(time.monotonic() - t0, 1.0, f"total={total} took too long")
+            self.assertGreaterEqual(event.eta_s, 0)
+
+    def test_the_tracker_replays_in_flight_pages_then_queued_ones(self):
+        from anydoc.progress import EtaTracker
+
+        now = [0.0]
+        tracker = EtaTracker("sim", 6, 2, clock=lambda: now[0])
+        self.assertIsNone(tracker.progress().eta_s)
+        tracker.page_started(1)
+        tracker.page_started(2)
+        now[0] = 4.0
+        tracker.page_done(1, 4.0)
+        tracker.page_started(3)  # worker A is free again, B still runs page 2
+        now[0] = 5.0
+        # mean 4s. Page 2 (started 0) is overdue, so it finishes at now + 0.4;
+        # page 3 finishes at 4 + 4 = 8. Pages 4-6 queue: 5.4 -> 9.4, 8 -> 12, 9.4 -> 13.4.
+        self.assertAlmostEqual(tracker.progress().eta_s, 13.4 - 5.0)
+        tracker.page_done(2, 5.0)
+        tracker.page_done(3, 1.0)
+        for page in (4, 5, 6):
+            tracker.page_done(page, 1.0)
+        self.assertEqual(tracker.progress().eta_s, 0.0)
 
 
 if __name__ == "__main__":
